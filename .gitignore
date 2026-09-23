@@ -1,0 +1,9 @@
+# Models are large binaries; download them rather than committing them.
+*.bin
+models/
+
+# Audio artifacts
+*.wav
+*.aiff
+
+.DS_Store

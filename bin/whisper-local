@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+#
+# whisper-local — local, offline push-to-talk dictation for macOS.
+#
+# Records from the system default input, transcribes with whisper.cpp, and
+# prints the text to stdout. Nothing leaves the machine.
+#
+#   whisper-local start            begin recording (backgrounded)
+#   whisper-local stop             finish recording, print the transcript
+#   whisper-local toggle           start if idle, stop if recording
+#   whisper-local transcribe FILE  transcribe an existing audio file
+#   whisper-local status           report current state and resolved config
+#   whisper-local doctor           check dependencies and test the microphone
+#   whisper-local version          print the version
+#
+# ── Output contract ─────────────────────────────────────────────────────────
+# Callers depend on this; do not weaken it.
+#
+#   exit 0, stdout non-empty : the transcript
+#   exit 0, stdout empty     : nothing usable was heard; stderr says why
+#   exit non-zero            : a real failure; stderr carries the message
+#
+# stdout is ONLY ever the transcript, so a caller can paste it blind. Every
+# diagnostic goes to stderr and to the log.
+#
+# ── Never rely on PATH ──────────────────────────────────────────────────────
+# This is designed to be driven by a GUI hotkey daemon. Processes spawned by
+# macOS LaunchServices inherit PATH=/usr/bin:/bin:/usr/sbin:/sbin, which does
+# not include Homebrew. A bare `sox` resolves fine in a login shell and fails
+# with 127 under a GUI app — producing an empty transcript on every run, with
+# the error swallowed. Every external binary here is resolved explicitly.
+#
+# Targets bash 3.2, the version macOS ships. No bash 4+ syntax.
+
+# Deliberately not `set -e`: this tool's job is to always explain itself, so
+# errors are handled explicitly rather than exiting silently mid-pipeline.
+set -uo pipefail
+
+WHISPER_LOCAL_VERSION="1.0.0"
+
+# ── Configuration ───────────────────────────────────────────────────────────
+# Every setting is an environment variable with a safe default. An optional
+# config file can set any of them; the environment still wins.
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_FILE="${WHISPER_LOCAL_CONFIG:-$CONFIG_HOME/whisper-local/config}"
+# shellcheck source=/dev/null
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# Input device. EMPTY IS THE DEFAULT AND THE RECOMMENDED SETTING: it records
+# from whatever macOS has set as the system default input, so the tool follows
+# the OS the way every other app does. Set it only to pin one specific device.
+DEVICE="${WHISPER_LOCAL_DEVICE:-}"
+
+LANG_CODE="${WHISPER_LOCAL_LANG:-en}"
+THREADS="${WHISPER_LOCAL_THREADS:-}"
+
+# Dead-stream thresholds. Raise if your mic is hot, lower if it is very quiet.
+PEAK_MIN="${WHISPER_LOCAL_PEAK_MIN:-0.0008}"
+RMS_MIN="${WHISPER_LOCAL_RMS_MIN:-0.0006}"
+# Shortest capture worth transcribing; below this it is a fumbled keypress.
+MIN_SEC="${WHISPER_LOCAL_MIN_SEC:-0.30}"
+# Hard cap so a forgotten recording cannot run until the disk fills. sox closes
+# the file cleanly and exits on its own when it reaches this.
+MAX_SEC="${WHISPER_LOCAL_MAX_SEC:-1800}"
+
+# Per-user state directory. Not $TMPDIR: macOS gives each process context a
+# different private $TMPDIR, so `start` and `stop` would not agree on a path.
+STATE_DIR="${WHISPER_LOCAL_STATE_DIR:-/tmp/whisper-local-$(id -u)}"
+mkdir -p "$STATE_DIR" 2>/dev/null
+chmod 700 "$STATE_DIR" 2>/dev/null
+
+WAV="$STATE_DIR/capture.wav"
+NORM="$STATE_DIR/capture.norm.wav"
+PIDFILE="$STATE_DIR/recorder.pid"
+DEVFILE="$STATE_DIR/device"
+LOG="${WHISPER_LOCAL_LOG:-$STATE_DIR/whisper-local.log}"
+
+# Core utilities, pinned. All are in the restricted GUI PATH.
+DATE="/bin/date"; AWK="/usr/bin/awk"; SED="/usr/bin/sed"; TR="/usr/bin/tr"; PS="/bin/ps"
+
+# ── Output helpers ──────────────────────────────────────────────────────────
+log() {
+    # Keep the log from growing without bound across months of daily use.
+    if [ -f "$LOG" ]; then
+        sz=$(/usr/bin/stat -f%z "$LOG" 2>/dev/null || echo 0)
+        [ "$sz" -gt 1048576 ] && mv -f "$LOG" "$LOG.1" 2>/dev/null
+    fi
+    printf '%s %s\n' "$("$DATE" '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
+}
+
+# Fatal: message on stderr and in the log, nothing on stdout, non-zero exit.
+die() { log "ERROR: $*"; printf '%s\n' "$*" >&2; exit 1; }
+
+# "Nothing usable": empty stdout, reason on stderr, exit 0.
+nothing() { log "EMPTY: $*"; printf '%s\n' "$*" >&2; exit 0; }
+
+# ── Dependency resolution (never trusts PATH) ───────────────────────────────
+resolve_bin() {
+    _name="$1"; shift
+    for _c in "$@"; do
+        [ -n "$_c" ] && [ -x "$_c" ] && { printf '%s\n' "$_c"; return 0; }
+    done
+    _c="$(command -v "$_name" 2>/dev/null)"
+    [ -n "$_c" ] && [ -x "$_c" ] && { printf '%s\n' "$_c"; return 0; }
+    return 1
+}
+
+SOX="${WHISPER_LOCAL_SOX:-$(resolve_bin sox \
+    /opt/homebrew/bin/sox /usr/local/bin/sox)}"
+
+# whisper.cpp's CLI is `whisper-cli`; older builds called it `main`.
+WHISPER="${WHISPER_LOCAL_WHISPER:-$(resolve_bin whisper-cli \
+    /opt/homebrew/bin/whisper-cli /usr/local/bin/whisper-cli \
+    "$HOME/code/whisper.cpp/build/bin/whisper-cli" \
+    "$HOME/whisper.cpp/build/bin/whisper-cli" \
+    "$HOME/src/whisper.cpp/build/bin/whisper-cli")}"
+
+# Optional: only used to name and list audio devices in `doctor`.
+SWITCHAUDIO="${WHISPER_LOCAL_SWITCHAUDIO:-$(resolve_bin SwitchAudioSource \
+    /opt/homebrew/bin/SwitchAudioSource /usr/local/bin/SwitchAudioSource)}"
+
+# Model discovery: an explicit setting wins, otherwise search the usual places
+# in descending order of quality so a fresh install just works.
+find_model() {
+    [ -n "${WHISPER_LOCAL_MODEL:-}" ] && { printf '%s\n' "$WHISPER_LOCAL_MODEL"; return 0; }
+    _dirs="${XDG_DATA_HOME:-$HOME/.local/share}/whisper-local/models
+$HOME/.local/share/whisper-local/models
+$HOME/code/whisper.cpp/models
+$HOME/whisper.cpp/models
+$HOME/src/whisper.cpp/models
+/opt/homebrew/share/whisper-cpp/models
+/usr/local/share/whisper-cpp/models"
+    _names="ggml-large-v3-turbo.bin ggml-large-v3.bin ggml-large-v2.bin
+ggml-medium.en.bin ggml-medium.bin ggml-small.en.bin ggml-small.bin
+ggml-base.en.bin ggml-base.bin ggml-tiny.en.bin ggml-tiny.bin"
+    for _n in $_names; do
+        for _d in $_dirs; do
+            [ -f "$_d/$_n" ] && { printf '%s\n' "$_d/$_n"; return 0; }
+        done
+    done
+    return 1
+}
+MODEL="$(find_model)"
+
+require_sox() {
+    [ -n "$SOX" ] || die "sox not found. Install it: brew install sox"
+}
+require_whisper() {
+    [ -n "$WHISPER" ] || die "whisper-cli not found. Install whisper.cpp, or set WHISPER_LOCAL_WHISPER."
+    [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no whisper model found. Download one and set WHISPER_LOCAL_MODEL."
+}
+
+# ── Recorder process management ─────────────────────────────────────────────
+# True only when $1 is a live pid that really is one of our recorders, so a
+# recycled pid can never be signalled by mistake.
+recorder_alive() {
+    _pid="${1:-}"
+    [ -n "$_pid" ] || return 1
+    case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$_pid" 2>/dev/null || return 1
+    case "$("$PS" -o command= -p "$_pid" 2>/dev/null)" in *sox*) return 0 ;; *) return 1 ;; esac
+}
+
+current_pid() { cat "$PIDFILE" 2>/dev/null; }
+
+# SIGINT first so sox writes a valid WAV trailer; escalate only if it refuses.
+stop_recorder() {
+    [ -f "$PIDFILE" ] || return 0
+    _pid="$(current_pid)"
+    if recorder_alive "$_pid"; then
+        log "stopping recorder pid=$_pid"
+        kill -INT "$_pid" 2>/dev/null
+        _i=0
+        while [ "$_i" -lt 100 ]; do
+            recorder_alive "$_pid" || break
+            /bin/sleep 0.05
+            _i=$((_i + 1))
+        done
+        if recorder_alive "$_pid"; then
+            log "pid=$_pid ignored SIGINT after 5s; sending TERM"
+            kill -TERM "$_pid" 2>/dev/null
+            /bin/sleep 0.5
+            recorder_alive "$_pid" && { log "escalating to KILL"; kill -KILL "$_pid" 2>/dev/null; }
+        fi
+    else
+        log "pidfile named pid=$_pid, which is not a live recorder; ignoring"
+    fi
+    rm -f "$PIDFILE"
+}
+
+# ── Audio helpers ───────────────────────────────────────────────────────────
+# Print "<peak> <rms> <seconds>" for an audio file.
+measure() {
+    _s="$("$SOX" "$1" -n stat 2>&1)"
+    _p="$(printf '%s\n' "$_s" | "$AWK" '/Maximum amplitude/{print $3; exit}')"
+    _r="$(printf '%s\n' "$_s" | "$AWK" '/RMS +amplitude/{print $3; exit}')"
+    _l="$(printf '%s\n' "$_s" | "$AWK" '/Length \(seconds\)/{print $3; exit}')"
+    printf '%s %s %s\n' "${_p:-0}" "${_r:-0}" "${_l:-0}"
+}
+
+# Start sox in the background writing 16 kHz mono 16-bit — whisper's native
+# format, so no resampling happens later. An empty $DEVICE means `-d`, the
+# system default input.
+spawn_recorder() {
+    if [ -n "$DEVICE" ]; then
+        log "capturing from device: $DEVICE"
+        "$SOX" -q -t coreaudio "$DEVICE" -r 16000 -c 1 -b 16 "$WAV" trim 0 "$MAX_SEC" \
+            </dev/null >>"$LOG" 2>&1 &
+    else
+        log "capturing from: system default input"
+        "$SOX" -q -d -r 16000 -c 1 -b 16 "$WAV" trim 0 "$MAX_SEC" \
+            </dev/null >>"$LOG" 2>&1 &
+    fi
+    printf '%s\n' "$!"
+}
+
+# Shared back half of `stop` and `transcribe`: gate, normalize, transcribe,
+# clean. Takes a 16 kHz mono WAV. Prints the transcript, or exits via
+# nothing()/die() with a reason.
+transcribe_wav() {
+    _src="$1"
+    _label="${2:-audio}"
+
+    set -- $(measure "$_src")
+    _peak="$1"; _rms="$2"; _secs="$3"
+    log "$_label: ${_secs}s peak=$_peak rms=$_rms"
+
+    if "$AWK" "BEGIN{exit !(($_secs) < ($MIN_SEC))}"; then
+        nothing "capture too short (${_secs}s) — hold the key until you have spoken"
+    fi
+
+    # Dead-stream guard. whisper.cpp hallucinates plausible filler on silent
+    # audio ("Thank you.", "you", "Thanks for watching"), and macOS hands back
+    # a stream of near-zeros when microphone access is denied, or when the
+    # selected input is not actually delivering samples. Gate on RMS as well as
+    # peak: a dead capture still throws transients past a peak floor, but its
+    # RMS stays around 0.00005 while real speech is above 0.002.
+    if "$AWK" "BEGIN{exit !(($_peak) < ($PEAK_MIN) || ($_rms) < ($RMS_MIN))}"; then
+        nothing "silent capture (peak=$_peak rms=$_rms, need peak>$PEAK_MIN rms>$RMS_MIN) — check the input device and microphone permission; run: whisper-local doctor"
+    fi
+
+    # Peak-normalize quiet-but-real audio to about -1 dBFS so a low-gain mic
+    # lands inside whisper's trained level range.
+    if "$SOX" "$_src" "$NORM" norm -1 2>>"$LOG"; then _in="$NORM"; else
+        log "normalize failed; using the raw capture"
+        _in="$_src"
+    fi
+
+    # -nt drops timestamps. -mc 8 bounds the decoder's text context, which
+    # prevents runaway repeat-loops on long captures. whisper's stderr goes to
+    # the log, never to /dev/null: discarding it makes a failing model load
+    # look exactly like silence.
+    set -- -m "$MODEL" -f "$_in" -l "$LANG_CODE" -nt -mc 8
+    [ -n "$THREADS" ] && set -- "$@" -t "$THREADS"
+    _raw="$("$WHISPER" "$@" 2>>"$LOG")"
+    _rc=$?
+    rm -f "$NORM"
+    [ "$_rc" -eq 0 ] || die "whisper-cli failed (exit $_rc) — see $LOG"
+
+    # Strip whisper's non-speech annotations — [BLANK_AUDIO], [SILENCE], and
+    # the *music* / *wind* asterisk forms — then flatten to a single line.
+    _text="$(printf '%s' "$_raw" \
+        | "$TR" -d '\r' \
+        | "$SED" -E 's/\[[^]]*\]//g; s/\*[^*]*\*//g' \
+        | "$TR" '\n' ' ' \
+        | "$SED" -E 's/  +/ /g; s/^ +//; s/ +$//')"
+
+    [ -n "$_text" ] || nothing "no speech detected (only non-speech markers) in ${_secs}s of audio"
+
+    log "transcript: $_text"
+    printf '%s\n' "$_text"
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+cmd_start() {
+    require_sox
+    log "──── start ────"
+    # Never leave two recorders fighting over the same file.
+    stop_recorder
+    # Delete the previous capture BEFORE recording. Without this, a start that
+    # fails to open the device leaves the last run's audio in place and `stop`
+    # transcribes stale speech as though it were just spoken.
+    rm -f "$WAV" "$NORM"
+    printf '%s\n' "${DEVICE:-system default input}" > "$DEVFILE"
+
+    _pid="$(spawn_recorder)"
+    printf '%s\n' "$_pid" > "$PIDFILE"
+
+    # Confirm the recorder actually came up. sox exits immediately when the
+    # device is unavailable or microphone access is blocked; reporting success
+    # anyway would surface the failure only as an empty transcript later.
+    _i=0
+    while [ "$_i" -lt 30 ]; do
+        if ! kill -0 "$_pid" 2>/dev/null; then
+            rm -f "$PIDFILE"
+            die "recorder exited immediately (${DEVICE:-system default input}). Recent log: $(tail -n 3 "$LOG" 2>/dev/null | "$TR" '\n' ' ')"
+        fi
+        [ -s "$WAV" ] && { log "recorder up (pid=$_pid)"; return 0; }
+        /bin/sleep 0.05
+        _i=$((_i + 1))
+    done
+    # Alive but nothing on disk yet: sox sometimes buffers the header. Let it run.
+    log "recorder pid=$_pid alive, no bytes after 1.5s; continuing"
+}
+
+cmd_stop() {
+    require_sox
+    require_whisper
+    log "──── stop ────"
+
+    _was_recording=0
+    [ -f "$PIDFILE" ] && _was_recording=1
+    stop_recorder
+
+    if [ "$_was_recording" -eq 0 ]; then
+        # No recorder was running, so anything on disk is stale by definition.
+        # Transcribing it would emit text the user never just spoke.
+        rm -f "$WAV" "$NORM"
+        die "stop called with no recording in progress"
+    fi
+
+    [ -s "$WAV" ] || nothing "no audio captured — the recorder produced an empty file"
+    transcribe_wav "$WAV" "capture from $(cat "$DEVFILE" 2>/dev/null)"
+}
+
+cmd_toggle() {
+    if recorder_alive "$(current_pid)"; then cmd_stop; else cmd_start; fi
+}
+
+cmd_transcribe() {
+    [ -n "${1:-}" ] || die "usage: whisper-local transcribe FILE"
+    [ -f "$1" ] || die "no such file: $1"
+    require_sox
+    require_whisper
+    log "──── transcribe $1 ────"
+    # Convert whatever was handed in to whisper's native format first, so any
+    # sox-readable file works regardless of rate, channels or container.
+    _conv="$STATE_DIR/input.wav"
+    "$SOX" "$1" -r 16000 -c 1 -b 16 "$_conv" 2>>"$LOG" \
+        || die "could not read audio file: $1 (see $LOG)"
+    transcribe_wav "$_conv" "file $1"
+    rm -f "$_conv"
+}
+
+cmd_status() {
+    printf 'whisper-local %s\n\n' "$WHISPER_LOCAL_VERSION"
+    printf '  sox       %s\n' "${SOX:-NOT FOUND}"
+    printf '  whisper   %s\n' "${WHISPER:-NOT FOUND}"
+    printf '  model     %s\n' "${MODEL:-NOT FOUND}"
+    printf '  input     %s\n' "${DEVICE:-system default}"
+    printf '  language  %s\n' "$LANG_CODE"
+    printf '  config    %s%s\n' "$CONFIG_FILE" "$([ -r "$CONFIG_FILE" ] && echo '' || echo '  (none)')"
+    printf '  state     %s\n' "$STATE_DIR"
+    printf '  log       %s\n' "$LOG"
+    _pid="$(current_pid)"
+    if recorder_alive "$_pid"; then
+        printf '  recording YES (pid %s)\n' "$_pid"
+    elif [ -f "$PIDFILE" ]; then
+        printf '  recording no (stale pidfile: %s)\n' "$_pid"
+    else
+        printf '  recording no\n'
+    fi
+}
+
+cmd_doctor() {
+    _rc=0
+    printf 'Dependencies\n'
+    if [ -n "$SOX" ]; then printf '  ok    sox       %s\n' "$SOX"
+    else printf '  FAIL  sox not found — brew install sox\n'; _rc=1; fi
+    if [ -n "$WHISPER" ]; then printf '  ok    whisper   %s\n' "$WHISPER"
+    else printf '  FAIL  whisper-cli not found — build whisper.cpp or set WHISPER_LOCAL_WHISPER\n'; _rc=1; fi
+    if [ -n "$MODEL" ] && [ -f "$MODEL" ]; then printf '  ok    model     %s\n' "$MODEL"
+    else printf '  FAIL  no model found — set WHISPER_LOCAL_MODEL\n'; _rc=1; fi
+
+    printf '\nAudio input\n'
+    if [ -n "$SWITCHAUDIO" ]; then
+        printf '  system default: %s\n' "$("$SWITCHAUDIO" -c -t input 2>/dev/null)"
+        printf '  available:\n'
+        "$SWITCHAUDIO" -a -t input 2>/dev/null | "$SED" 's/^/    /'
+    else
+        printf '  (install switchaudio-osx to list devices: brew install switchaudio-osx)\n'
+    fi
+    printf '  configured: %s\n' "${DEVICE:-system default}"
+
+    [ "$_rc" -eq 0 ] || { printf '\nDependencies are missing; skipping the microphone test.\n'; return 1; }
+
+    printf '\nMicrophone test — recording 3 seconds from %s.\n' "${DEVICE:-the system default input}"
+    printf 'Say something now.\n'
+    _t="$STATE_DIR/doctor.wav"
+    rm -f "$_t"
+    if [ -n "$DEVICE" ]; then
+        "$SOX" -q -t coreaudio "$DEVICE" -r 16000 -c 1 -b 16 "$_t" trim 0 3 2>&1
+    else
+        "$SOX" -q -d -r 16000 -c 1 -b 16 "$_t" trim 0 3 2>&1
+    fi
+    [ -s "$_t" ] || { printf '  FAIL  no audio was captured at all.\n'; return 1; }
+    set -- $(measure "$_t")
+    printf '  levels: peak=%s rms=%s duration=%ss\n' "$1" "$2" "$3"
+    if "$AWK" "BEGIN{exit !(($1) < ($PEAK_MIN) || ($2) < ($RMS_MIN))}"; then
+        printf '  FAIL  this input reads as dead (need peak>%s rms>%s).\n' "$PEAK_MIN" "$RMS_MIN"
+        printf '        - Check System Settings > Privacy & Security > Microphone and\n'
+        printf '          make sure the app that launches whisper-local is allowed.\n'
+        printf '        - Check System Settings > Sound > Input and pick a working device.\n'
+        printf '        - Bluetooth headsets often expose a silent input until macOS\n'
+        printf '          switches them to their headset profile; try a wired or built-in mic.\n'
+        _rc=1
+    else
+        printf '  ok    input is live\n'
+    fi
+    rm -f "$_t"
+    return "$_rc"
+}
+
+usage() {
+    "$SED" -n '3,20p' "$0" | "$SED" 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+    start)       cmd_start ;;
+    stop)        cmd_stop ;;
+    toggle)      cmd_toggle ;;
+    transcribe)  shift; cmd_transcribe "${1:-}" ;;
+    status)      cmd_status ;;
+    doctor)      cmd_doctor ;;
+    version|--version|-v) printf 'whisper-local %s\n' "$WHISPER_LOCAL_VERSION" ;;
+    help|--help|-h) usage ;;
+    *)           usage >&2; exit 2 ;;
+esac

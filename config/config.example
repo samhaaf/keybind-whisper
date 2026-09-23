@@ -1,0 +1,48 @@
+# whisper-local configuration
+#
+# Copy to ~/.config/whisper-local/config and edit. This file is sourced by the
+# shell, so use `name=value`. Every setting is optional: the defaults below are
+# what the tool uses when the file is absent. Environment variables override it.
+
+# ── Input device ────────────────────────────────────────────────────────────
+# Leave unset (the default) to record from whatever macOS has set as the system
+# default input. This is the recommended setting: dictation then follows the
+# device you pick in System Settings > Sound, like any other app.
+# Set it only to pin one specific device regardless of the system default. Use
+# the exact name shown by `whisper-local doctor`.
+# WHISPER_LOCAL_DEVICE="USB Audio CODEC"
+
+# ── Model and language ──────────────────────────────────────────────────────
+# By default the newest, highest-quality ggml model found in the usual
+# whisper.cpp locations is used. Set this to pin a specific one.
+# WHISPER_LOCAL_MODEL="$HOME/.local/share/whisper-local/models/ggml-large-v3-turbo.bin"
+
+# Spoken language, as an ISO 639-1 code. Use "auto" to detect it per recording,
+# at some cost in accuracy and speed.
+# WHISPER_LOCAL_LANG="en"
+
+# Decoding threads. Defaults to whisper.cpp's own choice.
+# WHISPER_LOCAL_THREADS="8"
+
+# ── Silence detection ───────────────────────────────────────────────────────
+# A capture below BOTH of these is treated as silence and never sent to the
+# model, because whisper invents plausible filler when given silent audio.
+# Lower them if a genuinely quiet microphone is being rejected; raise them if
+# room noise is getting transcribed. `whisper-local doctor` prints the levels
+# your microphone actually produces.
+# WHISPER_LOCAL_PEAK_MIN="0.0008"
+# WHISPER_LOCAL_RMS_MIN="0.0006"
+
+# ── Limits ──────────────────────────────────────────────────────────────────
+# Captures shorter than this are treated as a fumbled keypress, in seconds.
+# WHISPER_LOCAL_MIN_SEC="0.30"
+
+# Recording stops on its own after this many seconds, so a forgotten recording
+# cannot fill the disk.
+# WHISPER_LOCAL_MAX_SEC="1800"
+
+# ── Paths ───────────────────────────────────────────────────────────────────
+# Override only if the tool cannot find these on its own.
+# WHISPER_LOCAL_SOX="/opt/homebrew/bin/sox"
+# WHISPER_LOCAL_WHISPER="$HOME/code/whisper.cpp/build/bin/whisper-cli"
+# WHISPER_LOCAL_LOG="$HOME/Library/Logs/whisper-local.log"
