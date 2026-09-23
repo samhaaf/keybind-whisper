@@ -41,6 +41,19 @@
 # cannot fill the disk.
 # WHISPER_LOCAL_MAX_SEC="1800"
 
+# ── History ─────────────────────────────────────────────────────────────────
+# Every successful transcription is stored so it can be searched and reused.
+# This is dictated text, so treat the file as sensitive: it is written 0600
+# inside a 0700 directory and never leaves the machine.
+
+# Set to 0 to store nothing at all. No file is created.
+# WHISPER_LOCAL_HISTORY="1"
+
+# WHISPER_LOCAL_HISTORY_FILE="$HOME/.local/share/whisper-local/history.jsonl"
+
+# Entries kept before the oldest are dropped.
+# WHISPER_LOCAL_HISTORY_MAX="1000"
+
 # ── Paths ───────────────────────────────────────────────────────────────────
 # Override only if the tool cannot find these on its own.
 # WHISPER_LOCAL_SOX="/opt/homebrew/bin/sox"

@@ -24,6 +24,7 @@ run() {
     env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
         WHISPER_LOCAL_STATE_DIR="$WORK/state" \
         WHISPER_LOCAL_CONFIG="$WORK/nonexistent-config" \
+        WHISPER_LOCAL_HISTORY_FILE="$WORK/history.jsonl" \
         "$CLI" "$@"
 }
 
@@ -135,6 +136,95 @@ case "$o" in
     *) bad "a stale pidfile is detected rather than trusted" "$o" ;;
 esac
 rm -f "$WORK/state/recorder.pid"
+
+# ── History ─────────────────────────────────────────────────────────────────
+printf '\nhistory\n'
+
+# Earlier tests transcribe real audio, which correctly records history. Start
+# this section from a known-empty store so the counts below mean something.
+rm -f "$WORK/history.jsonl"
+
+run history list >/dev/null 2>&1; rc=$?
+check "history on an empty store exits non-zero" \
+    "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc"
+
+# Text that breaks a naive JSON writer: quotes, backslashes, brace characters.
+NASTY='He said "hi" then typed C:\path\to\file plus {"a":1} and 50%'
+run history add "$NASTY" >/dev/null 2>&1
+got="$(run history last)"
+check "adversarial text round-trips byte-identically" \
+    "$([ "$got" = "$NASTY" ] && echo 0 || echo 1)" "got: [$got]"
+
+# The store must stay valid JSON, or `history export` is worthless downstream.
+if command -v python3 >/dev/null 2>&1; then
+    if python3 -c "
+import json,sys
+for line in open('$WORK/history.jsonl'):
+    json.loads(line)
+" 2>/dev/null; then ok "every stored line is valid JSON"
+    else bad "every stored line is valid JSON" "a line failed to parse"; fi
+else
+    printf '  skip python3 unavailable; JSON validity not checked\n'
+fi
+
+run history add "second entry"  >/dev/null 2>&1
+run history add "third entry"   >/dev/null 2>&1
+
+# Index 1 is the newest. Getting this backwards makes "show the last one" wrong.
+check "index 1 is the most recent entry" \
+    "$([ "$(run history last)" = "third entry" ] && echo 0 || echo 1)" \
+    "got: [$(run history last)]"
+check "index counts backwards from newest" \
+    "$([ "$(run history show 2)" = "second entry" ] && echo 0 || echo 1)" \
+    "got: [$(run history show 2)]"
+
+n="$(run history list 2>/dev/null | wc -l | tr -d ' ')"
+check "list returns every entry" "$([ "$n" = "3" ] && echo 0 || echo 1)" "listed $n of 3"
+
+n="$(run history list 2 2>/dev/null | wc -l | tr -d ' ')"
+check "list honours a count limit" "$([ "$n" = "2" ] && echo 0 || echo 1)" "listed $n, wanted 2"
+
+run history show 99 >/dev/null 2>&1; rc=$?
+check "an out-of-range index exits non-zero" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc"
+
+run history show abc >/dev/null 2>&1; rc=$?
+check "a non-numeric index is rejected" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc"
+
+out="$(run history search "SECOND" 2>&1)"
+case "$out" in
+    *"second entry"*) ok "search is case-insensitive" ;;
+    *) bad "search is case-insensitive" "$out" ;;
+esac
+
+run history search "no-such-text" >/dev/null 2>&1; rc=$?
+check "search with no matches exits non-zero" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc"
+
+# Searching must not match metadata, or every query would hit every row.
+run history search "epoch" >/dev/null 2>&1; rc=$?
+check "search ignores metadata fields" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "matched a metadata key"
+
+perms="$(/usr/bin/stat -f '%Lp' "$WORK/history.jsonl" 2>/dev/null)"
+check "history file is not world-readable" \
+    "$([ "$perms" = "600" ] && echo 0 || echo 1)" "mode was $perms"
+
+run history clear >/dev/null 2>&1; rc=$?
+check "clear refuses without --yes" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc"
+check "clear without --yes leaves the store intact" \
+    "$([ -s "$WORK/history.jsonl" ] && echo 0 || echo 1)" "the store was deleted anyway"
+
+run history clear --yes >/dev/null 2>&1
+check "clear --yes removes the store" \
+    "$([ ! -s "$WORK/history.jsonl" ] && echo 0 || echo 1)" "the store survived"
+
+# Opting out must mean nothing is written at all.
+env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    WHISPER_LOCAL_STATE_DIR="$WORK/state" \
+    WHISPER_LOCAL_CONFIG="$WORK/nonexistent-config" \
+    WHISPER_LOCAL_HISTORY_FILE="$WORK/optout.jsonl" \
+    WHISPER_LOCAL_HISTORY=0 \
+    "$CLI" history add "must not be stored" >/dev/null 2>&1
+check "WHISPER_LOCAL_HISTORY=0 writes nothing" \
+    "$([ ! -f "$WORK/optout.jsonl" ] && echo 0 || echo 1)" "a history file was created anyway"
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 printf '\n%d passed, %d failed\n\n' "$PASS" "$FAIL"

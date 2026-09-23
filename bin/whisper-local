@@ -63,6 +63,17 @@ MIN_SEC="${WHISPER_LOCAL_MIN_SEC:-0.30}"
 # the file cleanly and exits on its own when it reaches this.
 MAX_SEC="${WHISPER_LOCAL_MAX_SEC:-1800}"
 
+# ── History ─────────────────────────────────────────────────────────────────
+# Every successful transcription is appended to a JSONL file so past dictation
+# can be found and reused. This is dictated text: treat it as sensitive. The
+# file is created 0600 inside a 0700 directory, and history can be turned off
+# entirely by setting WHISPER_LOCAL_HISTORY=0.
+HISTORY_ENABLED="${WHISPER_LOCAL_HISTORY:-1}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+HISTORY_FILE="${WHISPER_LOCAL_HISTORY_FILE:-$DATA_HOME/whisper-local/history.jsonl}"
+# Entries kept. Older ones are dropped as new ones arrive.
+HISTORY_MAX="${WHISPER_LOCAL_HISTORY_MAX:-1000}"
+
 # Per-user state directory. Not $TMPDIR: macOS gives each process context a
 # different private $TMPDIR, so `start` and `stop` would not agree on a path.
 STATE_DIR="${WHISPER_LOCAL_STATE_DIR:-/tmp/whisper-local-$(id -u)}"
@@ -198,6 +209,107 @@ measure() {
     printf '%s %s %s\n' "${_p:-0}" "${_r:-0}" "${_l:-0}"
 }
 
+# ── History store ───────────────────────────────────────────────────────────
+# Format is JSONL: one self-contained JSON object per line, newest last. It is
+# append-only, greppable with ordinary tools, and trivial to export. Field
+# order is fixed and `text` is always last, which is what lets the readers
+# below extract it without a JSON parser.
+
+# Escape a string for embedding in a JSON string literal. The text has already
+# been flattened to a single line, so stripping control characters outright is
+# safe and leaves only backslash and double quote to escape.
+json_escape() {
+    printf '%s' "$1" | "$TR" -d '\000-\037' | "$SED" -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# Shared awk helper: reverse a JSON string escape. Done in awk rather than with
+# sed placeholders so that backslashes in dictated text round-trip correctly.
+AWK_UNESCAPE='
+function unesc(s,   out, i, c, d) {
+    out = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && i < length(s)) {
+            i++; d = substr(s, i, 1)
+            out = out (d == "n" ? "\n" : (d == "t" ? "\t" : d))
+        } else out = out c
+    }
+    return out
+}
+function field(line, key,   m) {
+    m = line
+    if (!sub("^.*\"" key "\":\"", "", m)) return ""
+    sub("\".*$", "", m)
+    return m
+}
+function textof(line,   m) {
+    m = line
+    if (!sub(/^.*"text":"/, "", m)) return ""
+    sub(/"}[ \t]*$/, "", m)
+    return unesc(m)
+}
+'
+
+history_append() {
+    [ "$HISTORY_ENABLED" = "1" ] || return 0
+    _htext="$1"; _hsecs="$2"; _hpeak="$3"; _hrms="$4"; _hsrc="$5"
+
+    _hdir="$(dirname "$HISTORY_FILE")"
+    mkdir -p "$_hdir" 2>/dev/null || { log "history: cannot create $_hdir"; return 0; }
+    chmod 700 "$_hdir" 2>/dev/null
+    if [ ! -e "$HISTORY_FILE" ]; then
+        : > "$HISTORY_FILE" 2>/dev/null || { log "history: cannot write $HISTORY_FILE"; return 0; }
+    fi
+    chmod 600 "$HISTORY_FILE" 2>/dev/null
+
+    printf '{"ts":"%s","epoch":%s,"seconds":"%s","peak":"%s","rms":"%s","source":"%s","chars":%s,"text":"%s"}\n' \
+        "$("$DATE" '+%Y-%m-%dT%H:%M:%S%z')" \
+        "$("$DATE" '+%s')" \
+        "$(json_escape "$_hsecs")" \
+        "$(json_escape "$_hpeak")" \
+        "$(json_escape "$_hrms")" \
+        "$(json_escape "$_hsrc")" \
+        "$(printf '%s' "$_htext" | /usr/bin/wc -c | "$TR" -d ' ')" \
+        "$(json_escape "$_htext")" \
+        >> "$HISTORY_FILE" 2>/dev/null || log "history: append failed"
+
+    # Trim in batches rather than on every write, so a long history does not
+    # mean rewriting the whole file after every sentence.
+    _hcount="$(/usr/bin/wc -l < "$HISTORY_FILE" 2>/dev/null | "$TR" -d ' ')"
+    if [ -n "$_hcount" ] && [ "$_hcount" -gt $((HISTORY_MAX + 100)) ]; then
+        if tail -n "$HISTORY_MAX" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" 2>/dev/null; then
+            chmod 600 "$HISTORY_FILE.tmp" 2>/dev/null
+            mv -f "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+            log "history: trimmed to $HISTORY_MAX entries"
+        else
+            rm -f "$HISTORY_FILE.tmp"
+        fi
+    fi
+}
+
+history_require() {
+    [ -s "$HISTORY_FILE" ] || die "no history yet ($HISTORY_FILE)"
+}
+
+# Entry 1 is the most recent, counting backwards, which is how someone asks for
+# "the last one" or "three back".
+history_line_at() {
+    _n="${1:-1}"
+    case "$_n" in ''|*[!0-9]*) die "history index must be a number: $_n" ;; esac
+    [ "$_n" -ge 1 ] || die "history index starts at 1"
+    _total="$(/usr/bin/wc -l < "$HISTORY_FILE" | "$TR" -d ' ')"
+    [ "$_n" -le "$_total" ] || die "no history entry $_n (only $_total stored)"
+    tail -n "$_n" "$HISTORY_FILE" | head -n 1
+}
+
+history_text_at() {
+    # die() inside a command substitution only exits the subshell, so the
+    # failure has to be propagated explicitly or an invalid index would print
+    # an error and still exit 0.
+    _line="$(history_line_at "$1")" || exit 1
+    printf '%s\n' "$_line" | "$AWK" "$AWK_UNESCAPE"'{print textof($0)}'
+}
+
 # Start sox in the background writing 16 kHz mono 16-bit — whisper's native
 # format, so no resampling happens later. An empty $DEVICE means `-d`, the
 # system default input.
@@ -268,6 +380,7 @@ transcribe_wav() {
     [ -n "$_text" ] || nothing "no speech detected (only non-speech markers) in ${_secs}s of audio"
 
     log "transcript: $_text"
+    history_append "$_text" "$_secs" "$_peak" "$_rms" "${HISTORY_SOURCE:-unknown}"
     printf '%s\n' "$_text"
 }
 
@@ -320,6 +433,7 @@ cmd_stop() {
     fi
 
     [ -s "$WAV" ] || nothing "no audio captured — the recorder produced an empty file"
+    HISTORY_SOURCE="mic"
     transcribe_wav "$WAV" "capture from $(cat "$DEVFILE" 2>/dev/null)"
 }
 
@@ -338,6 +452,7 @@ cmd_transcribe() {
     _conv="$STATE_DIR/input.wav"
     "$SOX" "$1" -r 16000 -c 1 -b 16 "$_conv" 2>>"$LOG" \
         || die "could not read audio file: $1 (see $LOG)"
+    HISTORY_SOURCE="$1"
     transcribe_wav "$_conv" "file $1"
     rm -f "$_conv"
 }
@@ -411,8 +526,152 @@ cmd_doctor() {
     return "$_rc"
 }
 
+cmd_history() {
+    _sub="${1:-list}"
+    shift 2>/dev/null
+
+    case "$_sub" in
+        list|"")
+            history_require
+            _n="${1:-20}"
+            case "$_n" in ''|*[!0-9]*) die "usage: whisper-local history list [COUNT]" ;; esac
+            # Numbered newest-first, so the index matches `history show N`.
+            tail -n "$_n" "$HISTORY_FILE" | "$AWK" "$AWK_UNESCAPE"'
+                { lines[NR] = $0 }
+                END {
+                    for (i = NR; i >= 1; i--) {
+                        idx = NR - i + 1
+                        ts = field(lines[i], "ts")
+                        sub(/T/, " ", ts); sub(/[+-][0-9]{4}$/, "", ts)
+                        t = textof(lines[i])
+                        if (length(t) > 68) t = substr(t, 1, 65) "..."
+                        printf "%4d  %s  %s\n", idx, ts, t
+                    }
+                }'
+            ;;
+
+        add)
+            # Record a transcription that did not come from this tool. Useful
+            # for importing history from elsewhere, and for scripting.
+            if [ -n "${1:-}" ]; then _t="$1"; else _t="$(cat)"; fi
+            # Flatten exactly as a real transcript is flattened, so imported
+            # entries are indistinguishable in shape from recorded ones.
+            _t="$(printf '%s' "$_t" | "$TR" '\n' ' ' | "$SED" -E 's/  +/ /g; s/^ +//; s/ +$//')"
+            [ -n "$_t" ] || die "nothing to add"
+            HISTORY_SOURCE="${2:-import}"
+            history_append "$_t" "0" "0" "0" "$HISTORY_SOURCE"
+            printf 'added %s characters to history\n' "$(printf '%s' "$_t" | /usr/bin/wc -c | "$TR" -d ' ')" >&2
+            ;;
+
+        show)
+            history_require
+            history_text_at "${1:-1}"
+            ;;
+
+        last)
+            history_require
+            history_text_at 1
+            ;;
+
+        copy)
+            history_require
+            _t="$(history_text_at "${1:-1}")" || exit 1
+            printf '%s' "$_t" | /usr/bin/pbcopy
+            printf 'copied %s characters to the clipboard\n' "$(printf '%s' "$_t" | /usr/bin/wc -c | "$TR" -d ' ')" >&2
+            ;;
+
+        search)
+            history_require
+            [ -n "${1:-}" ] || die "usage: whisper-local history search QUERY"
+            # Case-insensitive substring match against the transcript text only,
+            # so metadata fields cannot produce spurious hits.
+            "$AWK" -v q="$1" "$AWK_UNESCAPE"'
+                { lines[NR] = $0 }
+                END {
+                    n = 0
+                    for (i = NR; i >= 1; i--) {
+                        t = textof(lines[i])
+                        if (index(tolower(t), tolower(q)) == 0) continue
+                        idx = NR - i + 1
+                        ts = field(lines[i], "ts")
+                        sub(/T/, " ", ts); sub(/[+-][0-9]{4}$/, "", ts)
+                        if (length(t) > 68) t = substr(t, 1, 65) "..."
+                        printf "%4d  %s  %s\n", idx, ts, t
+                        n++
+                    }
+                    if (n == 0) { print "no matches" > "/dev/stderr"; exit 1 }
+                }' "$HISTORY_FILE"
+            ;;
+
+        stats)
+            history_require
+            "$AWK" "$AWK_UNESCAPE"'
+                { n++; c += length(textof($0)); s += field($0, "seconds") + 0
+                  if (n == 1) first = field($0, "ts") }
+                END {
+                    sub(/T/, " ", first); sub(/[+-][0-9]{4}$/, "", first)
+                    printf "  entries    %d\n", n
+                    printf "  since      %s\n", first
+                    printf "  characters %d\n", c
+                    printf "  audio      %.1f minutes\n", s / 60
+                    if (n > 0) printf "  average    %d characters per dictation\n", c / n
+                }' "$HISTORY_FILE"
+            ;;
+
+        export)
+            history_require
+            cat "$HISTORY_FILE"
+            ;;
+
+        path)
+            printf '%s\n' "$HISTORY_FILE"
+            ;;
+
+        clear)
+            [ -s "$HISTORY_FILE" ] || die "no history to clear"
+            _count="$(/usr/bin/wc -l < "$HISTORY_FILE" | "$TR" -d ' ')"
+            # Destructive and unrecoverable, so require an explicit --yes rather
+            # than prompting: this is often run from a hotkey with no terminal.
+            if [ "${1:-}" != "--yes" ]; then
+                die "this deletes $_count stored transcriptions permanently. Re-run: whisper-local history clear --yes"
+            fi
+            rm -f "$HISTORY_FILE"
+            printf 'deleted %s stored transcriptions\n' "$_count" >&2
+            ;;
+
+        *)
+            die "unknown history command: $_sub (try: list, show, last, copy, search, add, stats, export, path, clear)"
+            ;;
+    esac
+}
+
 usage() {
-    "$SED" -n '3,20p' "$0" | "$SED" 's/^# \{0,1\}//'
+    cat <<'USAGE'
+whisper-local — offline push-to-talk dictation for macOS
+
+  whisper-local start               begin recording
+  whisper-local stop                finish recording, print the transcript
+  whisper-local toggle              start if idle, stop if recording
+  whisper-local transcribe FILE     transcribe an existing audio file
+
+  whisper-local history [list [N]]  recent transcriptions, newest first
+  whisper-local history show N      print entry N in full (1 = most recent)
+  whisper-local history last        print the most recent transcription
+  whisper-local history copy [N]    copy entry N to the clipboard
+  whisper-local history search Q    find past transcriptions containing Q
+  whisper-local history add TEXT    record a transcription from elsewhere
+  whisper-local history stats       how much has been dictated
+  whisper-local history export      raw JSONL on stdout
+  whisper-local history path        where history is stored
+  whisper-local history clear --yes delete all stored transcriptions
+
+  whisper-local status              current state and resolved configuration
+  whisper-local doctor              check dependencies and test the microphone
+  whisper-local version             print the version
+
+Audio is captured from the system default input and transcribed locally.
+Nothing leaves the machine.
+USAGE
 }
 
 case "${1:-}" in
@@ -420,6 +679,7 @@ case "${1:-}" in
     stop)        cmd_stop ;;
     toggle)      cmd_toggle ;;
     transcribe)  shift; cmd_transcribe "${1:-}" ;;
+    history)     shift; cmd_history "$@" ;;
     status)      cmd_status ;;
     doctor)      cmd_doctor ;;
     version|--version|-v) printf 'whisper-local %s\n' "$WHISPER_LOCAL_VERSION" ;;

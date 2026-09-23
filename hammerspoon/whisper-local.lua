@@ -9,10 +9,15 @@
 --- system default input, so it follows whatever you pick in System Settings.
 ---
 --- setup() options, all optional:
----   hotkey   { mods, key }  key binding to toggle dictation  (default ⌥Space)
----   bin      string         path to the whisper-local executable
----   menubar  boolean        show the menu bar indicator       (default true)
----   timeout  number         seconds before a wedged transcription is killed
+---   hotkey        { mods, key }  toggle dictation             (default ⌥Space)
+---   pasteHotkey   { mods, key }  re-paste the last transcription   (unbound)
+---   bin           string         path to the whisper-local executable
+---   menubar       boolean        show the menu bar indicator     (default true)
+---   historyCount  number         recent entries in the menu        (default 10)
+---   timeout       number         seconds before a wedged run is killed
+---
+--- The menu bar lists recent transcriptions; clicking one copies it. To paste
+--- the last one at the cursor without recording again, bind pasteHotkey.
 ---
 --- The CLI's output contract, which this file depends on:
 ---   exit 0 + non-empty stdout : the transcript
@@ -24,16 +29,19 @@
 local M = {}
 
 local cfg = {
-    hotkey  = { { "alt" }, "space" },
-    bin     = nil,
-    menubar = true,
-    timeout = 180,
+    hotkey       = { { "alt" }, "space" },  -- toggle dictation
+    pasteHotkey  = nil,                     -- re-paste the last transcription
+    bin          = nil,
+    menubar      = true,
+    timeout      = 180,
+    historyCount = 10,                      -- entries listed in the menu
 }
 
 -- hs.task objects are terminated when Lua garbage-collects them, so every
 -- running task must be held somewhere that outlives the function starting it.
 local startTask, stopTask, doctorTask = nil, nil, nil
-local watchdog, busyAlert, menu, hotkey = nil, nil, nil, nil
+local watchdog, busyAlert, menu = nil, nil, nil
+local hotkey, pasteHotkey = nil, nil
 local recording = false
 
 -- ── Locating the CLI ────────────────────────────────────────────────────────
@@ -213,6 +221,55 @@ function M.doctor()
     if doctorTask then doctorTask:start() else hs.alert.closeSpecific(alert) end
 end
 
+-- ── History ─────────────────────────────────────────────────────────────────
+-- Reading history is a file read, fast enough to do synchronously while the
+-- menu is being built. Recording and transcription stay asynchronous.
+local function cli(args)
+    local bin = findBin()
+    if not bin then return nil end
+    local out, ok = hs.execute(("%q %s 2>/dev/null"):format(bin, args))
+    if not ok then return nil end
+    return out
+end
+
+--- Recent transcriptions, newest first, as { index = N, when = "...", text = "..." }.
+function M.recent(count)
+    local out = cli("history list " .. tostring(count or 10))
+    if not out then return {} end
+    local items = {}
+    for line in out:gmatch("[^\r\n]+") do
+        -- Rows are "  N  YYYY-MM-DD HH:MM:SS  text", truncated for display.
+        local idx, when, text = line:match("^%s*(%d+)%s+([%d%-]+ [%d:]+)%s+(.*)$")
+        if idx then
+            items[#items + 1] = { index = tonumber(idx), when = when, text = text }
+        end
+    end
+    return items
+end
+
+--- Full text of a history entry (1 = most recent), or nil.
+function M.historyText(index)
+    local out = cli("history show " .. tostring(index or 1))
+    if not out or out == "" then return nil end
+    return (out:gsub("%s+$", ""))
+end
+
+--- Paste a past transcription at the cursor. Bind this to a hotkey to re-paste
+--- the last thing you dictated without recording it again.
+function M.pasteLast(index)
+    local text = M.historyText(index or 1)
+    if not text then hs.alert.show("🫥 no history yet", 3); return end
+    paste(text)
+end
+
+--- Copy a past transcription to the clipboard.
+function M.copyHistory(index)
+    local text = M.historyText(index or 1)
+    if not text then hs.alert.show("🫥 no history yet", 3); return end
+    hs.pasteboard.setContents(text)
+    hs.alert.show("📋 copied", 2)
+end
+
 -- ── Setup ───────────────────────────────────────────────────────────────────
 function M.setup(opts)
     for k, v in pairs(opts or {}) do cfg[k] = v end
@@ -221,12 +278,36 @@ function M.setup(opts)
         menu = hs.menubar.new()
         if menu then
             menu:setMenu(function()
-                return {
+                local items = {
                     { title = recording and "Stop dictation" or "Start dictation",
                       fn = M.toggle },
                     { title = "-" },
-                    { title = "Test microphone (3s)…", fn = M.doctor },
                 }
+
+                local recent = M.recent(cfg.historyCount)
+                if #recent == 0 then
+                    items[#items + 1] = { title = "No transcriptions yet", disabled = true }
+                else
+                    items[#items + 1] = { title = "Recent", disabled = true }
+                    for _, item in ipairs(recent) do
+                        -- Clicking COPIES rather than pastes. A menu click has
+                        -- already moved focus, so pasting could land in the
+                        -- wrong window; copying is always correct. Bind
+                        -- M.pasteLast to a hotkey for paste-at-cursor.
+                        items[#items + 1] = {
+                            title = "   " .. item.text,
+                            tooltip = item.when .. " — click to copy",
+                            fn = function() M.copyHistory(item.index) end,
+                        }
+                    end
+                    items[#items + 1] = { title = "-" }
+                    items[#items + 1] = { title = "Paste most recent at cursor",
+                                          fn = function() M.pasteLast(1) end }
+                end
+
+                items[#items + 1] = { title = "-" }
+                items[#items + 1] = { title = "Test microphone (3s)…", fn = M.doctor }
+                return items
             end)
         end
     end
@@ -234,6 +315,12 @@ function M.setup(opts)
     if cfg.hotkey then
         if hotkey then hotkey:delete() end
         hotkey = hs.hotkey.bind(cfg.hotkey[1], cfg.hotkey[2], M.toggle)
+    end
+
+    if cfg.pasteHotkey then
+        if pasteHotkey then pasteHotkey:delete() end
+        pasteHotkey = hs.hotkey.bind(cfg.pasteHotkey[1], cfg.pasteHotkey[2],
+                                     function() M.pasteLast(1) end)
     end
 
     -- Pick the real state back up after a config reload.
