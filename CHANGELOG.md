@@ -1,6 +1,6 @@
 # Changelog
 
-Notable changes to whisper-local. Versions follow
+Notable changes to keybound-whisper. Versions follow
 [semantic versioning](https://semver.org/).
 
 ## [1.0.0] — unreleased
@@ -12,7 +12,7 @@ First public release.
 - Offline push-to-talk dictation: record from the system default input,
   transcribe locally with whisper.cpp, paste at the cursor. Nothing leaves the
   machine.
-- Auto-stop on silence, via `WHISPER_LOCAL_SILENCE_SEC`. Off by default,
+- Auto-stop on silence, via `KEYBOUND_SILENCE_SEC`. Off by default,
   because the threshold depends on the room and the microphone; `doctor`
   measures both and recommends a value.
 - `dictate` records until you stop speaking and prints the transcript.
@@ -24,12 +24,12 @@ First public release.
 
 ### Getting words right
 
-- **Vocabulary.** Terms in `~/.config/whisper-local/vocabulary` are fed to the
+- **Vocabulary.** Terms in `~/.config/keybound-whisper/vocabulary` are fed to the
   model as an initial prompt, biasing decoding toward them. Framed as a
   sentence rather than a bare list: whisper imitates the prompt's style, and an
   unpunctuated fragment costs you capitalization in the transcript.
 - **Replacements.** `find = replace` rules in
-  `~/.config/whisper-local/replacements`, applied after transcription. Literal,
+  `~/.config/keybound-whisper/replacements`, applied after transcription. Literal,
   case-insensitive, whole-word, so a rule for `arm` cannot rewrite the middle
   of `alarm`. Applied in a single left-to-right pass so a replacement is never
   rescanned and rules cannot cascade into each other.
@@ -39,9 +39,9 @@ First public release.
 
 - Searchable transcription history: `list`, `show`, `last`, `copy`, `search`,
   `add`, `stats`, `export`, `clear`.
-- Stored as JSONL at `~/.local/share/whisper-local/history.jsonl`, mode 0600
-  inside a 0700 directory, capped at `WHISPER_LOCAL_HISTORY_MAX` entries, and
-  disabled entirely by `WHISPER_LOCAL_HISTORY=0` — which creates no file at all.
+- Stored as JSONL at `~/.local/share/keybound-whisper/history.jsonl`, mode 0600
+  inside a 0700 directory, capped at `KEYBOUND_HISTORY_MAX` entries, and
+  disabled entirely by `KEYBOUND_HISTORY=0` — which creates no file at all.
 - The Hammerspoon menu bar lists recent transcriptions and copies on click.
   Clicking does not paste: a menu click has already moved focus, so the paste
   could land in the wrong window. `pasteHotkey` covers paste-at-cursor.

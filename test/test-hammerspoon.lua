@@ -19,13 +19,13 @@ hs = {
     fs = { attributes = function(p)
         -- Pretend the CLI exists wherever it is looked for, and that the
         -- transcribing marker does not.
-        if p:match("whisper%-local$") then return { mode = "file" } end
+        if p:match("keybound%-whisper$") then return { mode = "file" } end
         return nil
     end },
     execute = function(cmd)
         executed[#executed + 1] = cmd
         if cmd:match("status") then
-            return "whisper-local 1.0.0\n  state     /tmp/wl-test\n  recording no\n", true
+            return "keybound-whisper 1.0.0\n  state     /tmp/wl-test\n  recording no\n", true
         elseif cmd:match("history list") then
             return "   1  2026-10-02 11:00:00  the newest one\n"
                 .. "   2  2026-10-02 10:59:00  the older one\n", true
@@ -56,8 +56,10 @@ hs = {
     end },
 }
 
-local home = os.getenv("HOME")
-local M = dofile(home .. "/code/whisper-local/hammerspoon/whisper-local.lua")
+-- Resolve the module relative to this script, so the suite works from any
+-- checkout location rather than assuming where the repository was cloned.
+local here = arg[0]:match("^(.*)/[^/]+$") or "."
+local M = dofile(here .. "/../hammerspoon/keybound-whisper.lua")
 
 print("\nhammerspoon module")
 

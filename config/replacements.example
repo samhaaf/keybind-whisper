@@ -1,4 +1,4 @@
-# whisper-local replacements
+# keybound-whisper replacements
 #
 # One `find = replace` rule per line. Applied after transcription.
 #
@@ -13,9 +13,9 @@
 #     cascade into one another.
 #   - An empty replacement deletes the term and reflows the spacing.
 #
-# Preview without recording:  whisper-local replace "some text"
+# Preview without recording:  keybound-whisper replace "some text"
 #
-# Copy to ~/.config/whisper-local/replacements and edit.
+# Copy to ~/.config/keybound-whisper/replacements and edit.
 
 # Spoken forms of things you write differently.
 arm sixty four = arm64

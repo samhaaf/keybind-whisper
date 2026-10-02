@@ -1,10 +1,13 @@
-# whisper-local
+# keybound-whisper
 
 Offline push-to-talk dictation for macOS. Press a key, speak, press it again —
 the text is transcribed by [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
 on your own machine and pasted at the cursor.
 
 No account, no network, no audio leaving the computer.
+
+The name is the point of the design: dictation is *bound to a key*. Press it,
+talk, press it again. Nothing listens until you ask it to.
 
 - **Follows the system default microphone.** Whatever you pick in System
   Settings is what it records, like any other app. Nothing to configure.
@@ -38,13 +41,13 @@ cd ~/code/whisper.cpp && cmake -B build && cmake --build build -j --config Relea
 
 `large-v3-turbo` is a good default: near the accuracy of `large-v3` at a
 fraction of the time. Any ggml model works — the tool finds the best one
-installed, or set `WHISPER_LOCAL_MODEL`.
+installed, or set `KEYBOUND_MODEL`.
 
 ## Install
 
 ```sh
-git clone https://github.com/YOUR-USERNAME/whisper-local ~/code/whisper-local
-cd ~/code/whisper-local
+git clone https://github.com/samhaaf/keybound-whisper ~/code/keybound-whisper
+cd ~/code/keybound-whisper
 ./install.sh --hammerspoon
 ```
 
@@ -53,39 +56,45 @@ This symlinks the CLI into `~/.local/bin` and the Lua module into
 it prints the line to add:
 
 ```lua
-require("whisper-local").setup({ hotkey = { { "alt" }, "space" } })
+require("keybound-whisper").setup({ hotkey = { { "alt" }, "space" } })
 ```
 
 Reload Hammerspoon, then confirm everything works:
 
 ```sh
-whisper-local doctor
+keybound-whisper doctor
 ```
 
 macOS will ask for microphone access the first time you record. The permission
 belongs to the app that *launches* the tool — Hammerspoon, or your terminal —
-not to `whisper-local` itself.
+not to `keybound-whisper` itself.
 
 ## Usage
 
 Press the hotkey, speak, press it again. The menu bar shows 🎙️ idle, 🔴
 recording, ⏳ transcribing.
 
-From the command line:
+From the command line. The Hammerspoon module calls the executable by absolute
+path, so the command name only matters if you type it yourself — and if you do,
+symlink it to something shorter:
 
 ```sh
-whisper-local start            # begin recording
-whisper-local stop             # finish, print the transcript to stdout
-whisper-local toggle           # start if idle, stop if recording
-whisper-local transcribe FILE  # transcribe an existing audio file
-whisper-local status           # current state and resolved configuration
-whisper-local doctor           # check dependencies and test the microphone
+ln -s ~/.local/bin/keybound-whisper ~/.local/bin/stt
+```
+
+```sh
+keybound-whisper start            # begin recording
+keybound-whisper stop             # finish, print the transcript to stdout
+keybound-whisper toggle           # start if idle, stop if recording
+keybound-whisper transcribe FILE  # transcribe an existing audio file
+keybound-whisper status           # current state and resolved configuration
+keybound-whisper doctor           # check dependencies and test the microphone
 ```
 
 `toggle` makes it easy to bind from any hotkey daemon:
 
 ```sh
-whisper-local toggle | pbcopy
+keybound-whisper toggle | pbcopy
 ```
 
 ### Output contract
@@ -108,7 +117,7 @@ of audio tuning fixes it. Two mechanisms address this, because they fail
 differently.
 
 **Vocabulary** biases the model while it decodes. Put one term per line in
-`~/.config/whisper-local/vocabulary`:
+`~/.config/keybound-whisper/vocabulary`:
 
 ```
 arm64
@@ -121,7 +130,7 @@ but it is a nudge, not a guarantee. When a word is acoustically far from the
 term you wanted, biasing will not rescue it.
 
 **Replacements** fix what the model gets wrong anyway, deterministically. Put
-`find = replace` lines in `~/.config/whisper-local/replacements`:
+`find = replace` lines in `~/.config/keybound-whisper/replacements`:
 
 ```
 # comments and blank lines are ignored
@@ -139,7 +148,7 @@ each other. An empty replacement deletes the term and reflows the spacing.
 Preview rules against any text without recording:
 
 ```sh
-whisper-local replace "deploy the arm sixty four build"
+keybound-whisper replace "deploy the arm sixty four build"
 # deploy the arm64 build
 ```
 
@@ -149,13 +158,13 @@ By default dictation is push-to-talk: the hotkey starts it and the hotkey stops
 it. To end a recording once you stop speaking instead:
 
 ```sh
-WHISPER_LOCAL_SILENCE_SEC=2 whisper-local dictate
+KEYBOUND_SILENCE_SEC=2 keybound-whisper dictate
 ```
 
 or in Hammerspoon:
 
 ```lua
-require("whisper-local").setup({
+require("keybound-whisper").setup({
     hotkey   = { { "alt" }, "space" },
     autoStop = 2,   -- seconds of silence that end the recording
 })
@@ -164,11 +173,11 @@ require("whisper-local").setup({
 The hotkey still ends a recording early. This is off by default because the
 silence threshold depends on your room and microphone: too high and quiet
 speech never registers, too low and room noise never counts as a pause.
-`whisper-local doctor` measures your actual levels and recommends a value:
+`keybound-whisper doctor` measures your actual levels and recommends a value:
 
 ```
   speech peaked at 34.20% of full scale
-  for auto-stop, try: WHISPER_LOCAL_SILENCE_THRESHOLD="8.6%"
+  for auto-stop, try: KEYBOUND_SILENCE_THRESHOLD="8.6%"
 ```
 
 ## History
@@ -177,12 +186,12 @@ Every successful transcription is stored, so a dictation you lost to the wrong
 window or an overwritten clipboard is still recoverable.
 
 ```sh
-whisper-local history                  # recent transcriptions, newest first
-whisper-local history show 3           # entry 3 in full
-whisper-local history last             # the most recent one
-whisper-local history copy 2           # put entry 2 on the clipboard
-whisper-local history search "domain"  # find past dictation by content
-whisper-local history stats            # how much you have dictated
+keybound-whisper history                  # recent transcriptions, newest first
+keybound-whisper history show 3           # entry 3 in full
+keybound-whisper history last             # the most recent one
+keybound-whisper history copy 2           # put entry 2 on the clipboard
+keybound-whisper history search "domain"  # find past dictation by content
+keybound-whisper history stats            # how much you have dictated
 ```
 
 ```
@@ -198,7 +207,7 @@ copies it. To re-paste the last thing you dictated without recording again,
 bind a second hotkey:
 
 ```lua
-require("whisper-local").setup({
+require("keybound-whisper").setup({
     hotkey      = { { "alt" }, "space" },  -- dictate
     pasteHotkey = { { "alt", "shift" }, "space" },  -- re-paste the last one
 })
@@ -207,16 +216,16 @@ require("whisper-local").setup({
 ### Storage and privacy
 
 History is dictated text, which can include anything you happened to say. It
-is stored at `~/.local/share/whisper-local/history.jsonl`, mode `0600` inside a
+is stored at `~/.local/share/keybound-whisper/history.jsonl`, mode `0600` inside a
 `0700` directory, and never leaves the machine.
 
 ```sh
-whisper-local history path             # where it lives
-whisper-local history export           # raw JSONL, one object per line
-whisper-local history clear --yes      # delete everything, permanently
+keybound-whisper history path             # where it lives
+keybound-whisper history export           # raw JSONL, one object per line
+keybound-whisper history clear --yes      # delete everything, permanently
 ```
 
-To keep no history at all, set `WHISPER_LOCAL_HISTORY=0`. Nothing is written,
+To keep no history at all, set `KEYBOUND_HISTORY=0`. Nothing is written,
 not even an empty file.
 
 The format is JSONL — one self-contained JSON object per line — so it stays
@@ -224,39 +233,39 @@ greppable with ordinary tools and imports anywhere. To bring history in from
 another tool:
 
 ```sh
-whisper-local history add "text from somewhere else"
-some-exporter | while IFS= read -r line; do whisper-local history add "$line"; done
+keybound-whisper history add "text from somewhere else"
+some-exporter | while IFS= read -r line; do keybound-whisper history add "$line"; done
 ```
 
 ## Configuration
 
 Everything works unconfigured. To change something, copy
 [`config/config.example`](config/config.example) to
-`~/.config/whisper-local/config`:
+`~/.config/keybound-whisper/config`:
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `WHISPER_LOCAL_DEVICE` | *system default* | Pin one input device instead of following the OS |
-| `WHISPER_LOCAL_MODEL` | best installed | Path to a ggml model |
-| `WHISPER_LOCAL_LANG` | `en` | Spoken language, or `auto` |
-| `WHISPER_LOCAL_THREADS` | whisper's choice | Decoding threads |
-| `WHISPER_LOCAL_PEAK_MIN` | `0.0008` | Silence gate, peak amplitude |
-| `WHISPER_LOCAL_RMS_MIN` | `0.0006` | Silence gate, RMS amplitude |
-| `WHISPER_LOCAL_MIN_SEC` | `0.30` | Shortest capture worth transcribing |
-| `WHISPER_LOCAL_MAX_SEC` | `1800` | Recording self-stops after this long |
-| `WHISPER_LOCAL_HISTORY` | `1` | Set to `0` to store nothing |
-| `WHISPER_LOCAL_HISTORY_FILE` | `~/.local/share/whisper-local/history.jsonl` | Where history lives |
-| `WHISPER_LOCAL_HISTORY_MAX` | `1000` | Entries kept before the oldest are dropped |
-| `WHISPER_LOCAL_SILENCE_SEC` | `0` | Seconds of silence that end a recording; `0` disables |
-| `WHISPER_LOCAL_SILENCE_THRESHOLD` | `2%` | Amplitude below which audio counts as silence |
-| `WHISPER_LOCAL_VOCAB_FILE` | `~/.config/whisper-local/vocabulary` | Terms to bias decoding toward |
-| `WHISPER_LOCAL_REPLACEMENTS_FILE` | `~/.config/whisper-local/replacements` | Post-transcription fix-ups |
+| `KEYBOUND_DEVICE` | *system default* | Pin one input device instead of following the OS |
+| `KEYBOUND_MODEL` | best installed | Path to a ggml model |
+| `KEYBOUND_LANG` | `en` | Spoken language, or `auto` |
+| `KEYBOUND_THREADS` | whisper's choice | Decoding threads |
+| `KEYBOUND_PEAK_MIN` | `0.0008` | Silence gate, peak amplitude |
+| `KEYBOUND_RMS_MIN` | `0.0006` | Silence gate, RMS amplitude |
+| `KEYBOUND_MIN_SEC` | `0.30` | Shortest capture worth transcribing |
+| `KEYBOUND_MAX_SEC` | `1800` | Recording self-stops after this long |
+| `KEYBOUND_HISTORY` | `1` | Set to `0` to store nothing |
+| `KEYBOUND_HISTORY_FILE` | `~/.local/share/keybound-whisper/history.jsonl` | Where history lives |
+| `KEYBOUND_HISTORY_MAX` | `1000` | Entries kept before the oldest are dropped |
+| `KEYBOUND_SILENCE_SEC` | `0` | Seconds of silence that end a recording; `0` disables |
+| `KEYBOUND_SILENCE_THRESHOLD` | `2%` | Amplitude below which audio counts as silence |
+| `KEYBOUND_VOCAB_FILE` | `~/.config/keybound-whisper/vocabulary` | Terms to bias decoding toward |
+| `KEYBOUND_REPLACEMENTS_FILE` | `~/.config/keybound-whisper/replacements` | Post-transcription fix-ups |
 
 Environment variables override the config file.
 
 ## Troubleshooting
 
-Start with `whisper-local doctor`. It resolves every dependency, lists the
+Start with `keybound-whisper doctor`. It resolves every dependency, lists the
 audio devices, records three seconds, and prints the levels it measured.
 
 **"silent capture"** — the microphone produced near-zero samples. Either the
@@ -272,14 +281,14 @@ which needs Accessibility permission for the launching app.
 **It works in a terminal but not from the hotkey** — this is the classic one.
 GUI-launched processes on macOS inherit `PATH=/usr/bin:/bin:/usr/sbin:/sbin`,
 which excludes Homebrew, so a bare `sox` fails with exit 127 while working
-perfectly in your shell. `whisper-local` resolves every binary by absolute
+perfectly in your shell. `keybound-whisper` resolves every binary by absolute
 path for exactly this reason, and the test suite runs under that restricted
 PATH to keep it that way.
 
 The log has a timestamped line for every run, including measured audio levels:
 
 ```sh
-tail -f "$(whisper-local status | awk '/log/{print $2}')"
+tail -f "$(keybound-whisper status | awk '/log/{print $2}')"
 ```
 
 ## Compared to Superwhisper
@@ -288,7 +297,7 @@ tail -f "$(whisper-local status | awk '/log/{print $2}')"
 this space, and it is the benchmark worth measuring against. What it does that
 this does not, as of now:
 
-| | whisper-local | Superwhisper |
+| | keybound-whisper | Superwhisper |
 |---|---|---|
 | Local transcription | yes | yes |
 | Searchable history | yes | yes |

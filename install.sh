@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install.sh — link whisper-local into place.
+# install.sh — link keybound-whisper into place.
 #
 #   ./install.sh                 install the CLI into ~/.local/bin
 #   ./install.sh --hammerspoon   also link the Hammerspoon module
@@ -40,10 +40,10 @@ link() { # link <source> <destination>
     printf '  linked          %s\n' "$dst"
 }
 
-printf '\nInstalling whisper-local\n\n'
+printf '\nInstalling keybound-whisper\n\n'
 
 mkdir -p "$PREFIX/bin"
-link "$ROOT/bin/whisper-local" "$PREFIX/bin/whisper-local"
+link "$ROOT/bin/keybound-whisper" "$PREFIX/bin/keybound-whisper"
 
 case ":$PATH:" in
     *":$PREFIX/bin:"*) ;;
@@ -55,14 +55,14 @@ if [ "$DO_HS" -eq 1 ]; then
     HS_DIR="$HOME/.hammerspoon"
     if [ -d "$HS_DIR" ]; then
         printf '\nHammerspoon\n\n'
-        link "$ROOT/hammerspoon/whisper-local.lua" "$HS_DIR/whisper-local.lua"
+        link "$ROOT/hammerspoon/keybound-whisper.lua" "$HS_DIR/keybound-whisper.lua"
         printf '\n  Add this to %s/init.lua, then reload Hammerspoon:\n\n' "$HS_DIR"
-        printf '      require("whisper-local").setup({ hotkey = { { "alt" }, "space" } })\n'
+        printf '      require("keybound-whisper").setup({ hotkey = { { "alt" }, "space" } })\n'
     else
         printf '\n  Hammerspoon config directory not found at %s; skipping.\n' "$HS_DIR"
     fi
 fi
 
 printf '\nChecking dependencies\n\n'
-"$ROOT/bin/whisper-local" doctor 2>/dev/null | sed -n '1,8p' | sed 's/^/  /'
-printf '\nRun `whisper-local doctor` for a full check, including a microphone test.\n\n'
+"$ROOT/bin/keybound-whisper" doctor 2>/dev/null | sed -n '1,8p' | sed 's/^/  /'
+printf '\nRun `keybound-whisper doctor` for a full check, including a microphone test.\n\n'

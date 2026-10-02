@@ -1,4 +1,4 @@
-# whisper-local vocabulary
+# keybound-whisper vocabulary
 #
 # One term per line. These are fed to the model as an initial prompt, which
 # biases decoding toward them. Use it for words the model has no reason to
@@ -7,7 +7,7 @@
 # This is a nudge, not a guarantee. When a word comes out acoustically far from
 # what you wanted, fix it in `replacements` instead.
 #
-# Copy to ~/.config/whisper-local/vocabulary and edit.
+# Copy to ~/.config/keybound-whisper/vocabulary and edit.
 
 arm64
 Kubernetes

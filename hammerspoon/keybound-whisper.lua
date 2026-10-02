@@ -1,8 +1,8 @@
---- whisper-local.lua — Hammerspoon front end for the whisper-local CLI.
+--- keybound-whisper.lua — Hammerspoon front end for the keybound-whisper CLI.
 ---
 --- Install this file next to your init.lua, then in init.lua:
 ---
----     require("whisper-local").setup({ hotkey = { { "alt" }, "space" } })
+---     require("keybound-whisper").setup({ hotkey = { { "alt" }, "space" } })
 ---
 --- Press the hotkey to start recording, press it again to stop: the text is
 --- transcribed locally and pasted at the cursor. Audio is captured from the
@@ -11,7 +11,7 @@
 --- setup() options, all optional:
 ---   hotkey        { mods, key }  toggle dictation             (default ⌥Space)
 ---   pasteHotkey   { mods, key }  re-paste the last transcription   (unbound)
----   bin           string         path to the whisper-local executable
+---   bin           string         path to the keybound-whisper executable
 ---   menubar       boolean        show the menu bar indicator     (default true)
 ---   historyCount  number         recent entries in the menu        (default 10)
 ---   timeout       number         seconds before a wedged run is killed
@@ -57,11 +57,11 @@ local function findBin()
     if cfg.bin then return cfg.bin end
     local home = os.getenv("HOME")
     local candidates = {
-        home .. "/.local/bin/whisper-local",
-        "/opt/homebrew/bin/whisper-local",
-        "/usr/local/bin/whisper-local",
-        home .. "/code/whisper-local/bin/whisper-local",
-        home .. "/whisper-local/bin/whisper-local",
+        home .. "/.local/bin/keybound-whisper",
+        "/opt/homebrew/bin/keybound-whisper",
+        "/usr/local/bin/keybound-whisper",
+        home .. "/code/keybound-whisper/bin/keybound-whisper",
+        home .. "/keybound-whisper/bin/keybound-whisper",
     }
     for _, p in ipairs(candidates) do
         local attr = hs.fs.attributes(p)
@@ -85,13 +85,13 @@ local function setState(state)
     if not menu then return end
     if state == "recording" then
         menu:setTitle("🔴")
-        menu:setTooltip("whisper-local: recording — press the hotkey to stop")
+        menu:setTooltip("keybound-whisper: recording — press the hotkey to stop")
     elseif state == "transcribing" then
         menu:setTitle("⏳")
-        menu:setTooltip("whisper-local: transcribing…")
+        menu:setTooltip("keybound-whisper: transcribing…")
     else
         menu:setTitle("🎙️")
-        menu:setTooltip("whisper-local: ready")
+        menu:setTooltip("keybound-whisper: ready")
     end
 end
 
@@ -106,7 +106,7 @@ end
 local function showError(msg)
     msg = (msg or ""):gsub("%s+$", "")
     if msg == "" then msg = "dictation failed (no detail available)" end
-    print("[whisper-local] " .. msg)
+    print("[keybound-whisper] " .. msg)
     hs.alert.show("⚠️ " .. msg, 6)
 end
 
@@ -132,7 +132,7 @@ end
 function M.start()
     local bin = findBin()
     if not bin then
-        showError("whisper-local executable not found — pass setup({ bin = \"/path/to/whisper-local\" })")
+        showError("keybound-whisper executable not found — pass setup({ bin = \"/path/to/keybound-whisper\" })")
         return
     end
 
@@ -164,7 +164,7 @@ end
 
 function M.stop()
     local bin = findBin()
-    if not bin then showError("whisper-local executable not found"); return end
+    if not bin then showError("keybound-whisper executable not found"); return end
 
     recording = false
     setState("transcribing")
@@ -242,7 +242,7 @@ end
 
 function M.dictate()
     local bin = findBin()
-    if not bin then showError("whisper-local executable not found"); return end
+    if not bin then showError("keybound-whisper executable not found"); return end
 
     recording = true
     setState("recording")
@@ -317,13 +317,13 @@ end
 
 function M.doctor()
     local bin = findBin()
-    if not bin then showError("whisper-local executable not found"); return end
+    if not bin then showError("keybound-whisper executable not found"); return end
     local alert = hs.alert.show("🎚️ testing microphone for 3s…", math.huge)
     doctorTask = hs.task.new(bin, function(code, stdout, _stderr)
         doctorTask = nil
         hs.alert.closeSpecific(alert)
         hs.alert.show((code == 0 and "✅ " or "⚠️ ") .. (stdout or ""), 12)
-        print("[whisper-local] doctor:\n" .. (stdout or ""))
+        print("[keybound-whisper] doctor:\n" .. (stdout or ""))
     end, { "doctor" })
     if doctorTask then doctorTask:start() else hs.alert.closeSpecific(alert) end
 end
@@ -427,7 +427,7 @@ function M.setup(opts)
     if recorderAlive() then
         recording = true
         setState("recording")
-        print("[whisper-local] resumed: a recording was already in progress")
+        print("[keybound-whisper] resumed: a recording was already in progress")
     else
         recording = false
         setState("idle")
@@ -436,7 +436,7 @@ function M.setup(opts)
     return M
 end
 
---- Convenience for `require("whisper-local").bind({"alt"}, "space")`.
+--- Convenience for `require("keybound-whisper").bind({"alt"}, "space")`.
 function M.bind(mods, key)
     return M.setup({ hotkey = { mods, key } })
 end
