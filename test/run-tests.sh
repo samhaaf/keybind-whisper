@@ -350,6 +350,79 @@ check "the silence effect ends a stream on trailing silence" \
     "$(awk -v a="$long" -v b="$cut" 'BEGIN{exit !(b > 0.5 && b < a - 3)}' && echo 0 || echo 1)" \
     "input ${long}s produced ${cut}s; expected a substantial cut"
 
+# ── Installer ───────────────────────────────────────────────────────────────
+printf '\ninstaller\n'
+
+# The installer is meant to be run as `curl ... | bash`, where bash reads the
+# script from stdin as it executes. Any child that reads stdin eats the rest of
+# the script and bash exits 0 partway through, looking like success. That
+# really happened: `hs -c` reads stdin, so the installer stopped right after
+# reloading Hammerspoon and never printed its results. Piping it here and
+# requiring the FINAL line is the only way to catch that.
+# Drive the FULL path, Hammerspoon branch included, against a throwaway config
+# directory. Skipping that branch would skip the `hs` call that reads stdin,
+# which is exactly the hazard being tested — an earlier version of this test
+# passed with the bug reintroduced for precisely that reason.
+mkdir -p "$WORK/hs"
+printf -- '-- test config\n' > "$WORK/hs/init.lua"
+if cat "$ROOT/install.sh" | env KEYBIND_SRC="$ROOT" KEYBIND_NO_FETCH=1 \
+        KEYBIND_HS_DIR="$WORK/hs" \
+        bash -s -- --no-deps --no-reload --prefix "$WORK/prefix" \
+        > "$WORK/install.out" 2>&1; then
+    if grep -q '^Installed\.' "$WORK/install.out"; then
+        ok "piped to bash, the installer runs to completion"
+    else
+        bad "piped to bash, the installer runs to completion" \
+            "the final line is missing — a child process ate stdin: $(tail -3 "$WORK/install.out")"
+    fi
+else
+    bad "piped to bash, the installer runs to completion" "non-zero exit: $(tail -3 "$WORK/install.out")"
+fi
+
+case "$(cat "$WORK/install.out")" in
+    *"hs"*|*"Hammerspoon"*) ok "the Hammerspoon branch actually ran (the stdin hazard was exercised)" ;;
+    *) bad "the Hammerspoon branch actually ran" "it was skipped, so the test proves nothing" ;;
+esac
+
+check "the installer wires the require line into init.lua" \
+    "$(grep -q 'require("keybind-whisper")' "$WORK/hs/init.lua" && echo 0 || echo 1)" \
+    "init.lua was not wired: $(cat "$WORK/hs/init.lua")"
+
+check "the installer links the Hammerspoon module" \
+    "$([ -L "$WORK/hs/keybind-whisper.lua" ] && echo 0 || echo 1)" \
+    "no module symlink in the test config dir"
+
+check "the installer links the command" \
+    "$([ -L "$WORK/prefix/bin/keybind-whisper" ] && echo 0 || echo 1)" \
+    "no symlink at $WORK/prefix/bin/keybind-whisper"
+
+# Every command in the installer must be inside main(), called on the last
+# line, so bash parses the whole thing before executing any of it.
+check "the installer body is wrapped in main()" \
+    "$([ "$(tail -1 "$ROOT/install.sh")" = 'main "$@"' ] && echo 0 || echo 1)" \
+    "the last line is: $(tail -1 "$ROOT/install.sh")"
+
+# Running it twice must change nothing.
+cat "$ROOT/install.sh" | env KEYBIND_SRC="$ROOT" KEYBIND_NO_FETCH=1 \
+    KEYBIND_HS_DIR="$WORK/hs" \
+    bash -s -- --no-deps --no-reload --prefix "$WORK/prefix" \
+    > "$WORK/install2.out" 2>&1
+case "$(cat "$WORK/install2.out")" in
+    *"ok       $WORK/prefix/bin/keybind-whisper"*) ok "a second run is idempotent" ;;
+    *) bad "a second run is idempotent" "$(grep -A1 '^Command' "$WORK/install2.out")" ;;
+esac
+
+# And it must be able to undo itself.
+cat "$ROOT/install.sh" | env KEYBIND_SRC="$ROOT" KEYBIND_NO_FETCH=1 \
+    KEYBIND_HS_DIR="$WORK/hs" \
+    bash -s -- --uninstall --prefix "$WORK/prefix" > "$WORK/uninstall.out" 2>&1
+check "--uninstall removes the command" \
+    "$([ ! -e "$WORK/prefix/bin/keybind-whisper" ] && echo 0 || echo 1)" \
+    "the symlink survived uninstall"
+check "--uninstall removes the require line from init.lua" \
+    "$(grep -q 'require("keybind-whisper")' "$WORK/hs/init.lua" && echo 1 || echo 0)" \
+    "the require line survived uninstall"
+
 # ── Hammerspoon module ──────────────────────────────────────────────────────
 if command -v lua >/dev/null 2>&1; then
     if lua "$ROOT/test/test-hammerspoon.lua" > "$WORK/lua.out" 2>&1; then
