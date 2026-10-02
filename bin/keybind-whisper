@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# keybound-whisper — local, offline push-to-talk dictation for macOS.
+# keybind-whisper — local, offline push-to-talk dictation for macOS.
 #
 # Records from the system default input, transcribes with whisper.cpp, and
 # prints the text to stdout. Nothing leaves the machine.
 #
-#   keybound-whisper start            begin recording (backgrounded)
-#   keybound-whisper stop             finish recording, print the transcript
-#   keybound-whisper toggle           start if idle, stop if recording
-#   keybound-whisper transcribe FILE  transcribe an existing audio file
-#   keybound-whisper status           report current state and resolved config
-#   keybound-whisper doctor           check dependencies and test the microphone
-#   keybound-whisper version          print the version
+#   keybind-whisper start            begin recording (backgrounded)
+#   keybind-whisper stop             finish recording, print the transcript
+#   keybind-whisper toggle           start if idle, stop if recording
+#   keybind-whisper transcribe FILE  transcribe an existing audio file
+#   keybind-whisper status           report current state and resolved config
+#   keybind-whisper doctor           check dependencies and test the microphone
+#   keybind-whisper version          print the version
 #
 # ── Output contract ─────────────────────────────────────────────────────────
 # Callers depend on this; do not weaken it.
@@ -36,53 +36,53 @@
 # errors are handled explicitly rather than exiting silently mid-pipeline.
 set -uo pipefail
 
-KEYBOUND_VERSION="1.0.0"
+KEYBIND_VERSION="1.0.0"
 
 # ── Configuration ───────────────────────────────────────────────────────────
 # Every setting is an environment variable with a safe default. An optional
 # config file can set any of them; the environment still wins.
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-CONFIG_FILE="${KEYBOUND_CONFIG:-$CONFIG_HOME/keybound-whisper/config}"
+CONFIG_FILE="${KEYBIND_CONFIG:-$CONFIG_HOME/keybind-whisper/config}"
 # shellcheck source=/dev/null
 [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
 # Input device. EMPTY IS THE DEFAULT AND THE RECOMMENDED SETTING: it records
 # from whatever macOS has set as the system default input, so the tool follows
 # the OS the way every other app does. Set it only to pin one specific device.
-DEVICE="${KEYBOUND_DEVICE:-}"
+DEVICE="${KEYBIND_DEVICE:-}"
 
-LANG_CODE="${KEYBOUND_LANG:-en}"
-THREADS="${KEYBOUND_THREADS:-}"
+LANG_CODE="${KEYBIND_LANG:-en}"
+THREADS="${KEYBIND_THREADS:-}"
 
 # Dead-stream thresholds. Raise if your mic is hot, lower if it is very quiet.
-PEAK_MIN="${KEYBOUND_PEAK_MIN:-0.0008}"
-RMS_MIN="${KEYBOUND_RMS_MIN:-0.0006}"
+PEAK_MIN="${KEYBIND_PEAK_MIN:-0.0008}"
+RMS_MIN="${KEYBIND_RMS_MIN:-0.0006}"
 # Shortest capture worth transcribing; below this it is a fumbled keypress.
-MIN_SEC="${KEYBOUND_MIN_SEC:-0.30}"
+MIN_SEC="${KEYBIND_MIN_SEC:-0.30}"
 # Hard cap so a forgotten recording cannot run until the disk fills. sox closes
 # the file cleanly and exits on its own when it reaches this.
-MAX_SEC="${KEYBOUND_MAX_SEC:-1800}"
+MAX_SEC="${KEYBIND_MAX_SEC:-1800}"
 
 # ── History ─────────────────────────────────────────────────────────────────
 # Every successful transcription is appended to a JSONL file so past dictation
 # can be found and reused. This is dictated text: treat it as sensitive. The
 # file is created 0600 inside a 0700 directory, and history can be turned off
-# entirely by setting KEYBOUND_HISTORY=0.
-HISTORY_ENABLED="${KEYBOUND_HISTORY:-1}"
+# entirely by setting KEYBIND_HISTORY=0.
+HISTORY_ENABLED="${KEYBIND_HISTORY:-1}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-HISTORY_FILE="${KEYBOUND_HISTORY_FILE:-$DATA_HOME/keybound-whisper/history.jsonl}"
+HISTORY_FILE="${KEYBIND_HISTORY_FILE:-$DATA_HOME/keybind-whisper/history.jsonl}"
 # Entries kept. Older ones are dropped as new ones arrive.
-HISTORY_MAX="${KEYBOUND_HISTORY_MAX:-1000}"
+HISTORY_MAX="${KEYBIND_HISTORY_MAX:-1000}"
 
 # ── Auto-stop on silence ────────────────────────────────────────────────────
 # Seconds of silence that end a recording. 0 disables it, which is the default:
 # the tool is push-to-talk, so recording normally ends when you say it does.
 # When enabled, `dictate` records until you stop speaking.
-SILENCE_SEC="${KEYBOUND_SILENCE_SEC:-0}"
+SILENCE_SEC="${KEYBIND_SILENCE_SEC:-0}"
 # Amplitude below which audio counts as silence, as a percentage of full scale.
 # Must sit above your room noise and below your speech. `doctor` measures both
 # and prints a recommendation.
-SILENCE_THRESHOLD="${KEYBOUND_SILENCE_THRESHOLD:-2%}"
+SILENCE_THRESHOLD="${KEYBIND_SILENCE_THRESHOLD:-2%}"
 
 # ── Vocabulary and replacements ─────────────────────────────────────────────
 # Two separate mechanisms, because they fix different failures.
@@ -92,12 +92,12 @@ SILENCE_THRESHOLD="${KEYBOUND_SILENCE_THRESHOLD:-2%}"
 #              mistranscribed, but is a nudge, not a guarantee.
 # replacements literal find-and-replace applied after transcription. Catches
 #              what the model gets wrong anyway, deterministically.
-VOCAB_FILE="${KEYBOUND_VOCAB_FILE:-$CONFIG_HOME/keybound-whisper/vocabulary}"
-REPLACEMENTS_FILE="${KEYBOUND_REPLACEMENTS_FILE:-$CONFIG_HOME/keybound-whisper/replacements}"
+VOCAB_FILE="${KEYBIND_VOCAB_FILE:-$CONFIG_HOME/keybind-whisper/vocabulary}"
+REPLACEMENTS_FILE="${KEYBIND_REPLACEMENTS_FILE:-$CONFIG_HOME/keybind-whisper/replacements}"
 
 # Per-user state directory. Not $TMPDIR: macOS gives each process context a
 # different private $TMPDIR, so `start` and `stop` would not agree on a path.
-STATE_DIR="${KEYBOUND_STATE_DIR:-/tmp/keybound-whisper-$(id -u)}"
+STATE_DIR="${KEYBIND_STATE_DIR:-/tmp/keybind-whisper-$(id -u)}"
 mkdir -p "$STATE_DIR" 2>/dev/null
 chmod 700 "$STATE_DIR" 2>/dev/null
 
@@ -106,7 +106,7 @@ NORM="$STATE_DIR/capture.norm.wav"
 PIDFILE="$STATE_DIR/recorder.pid"
 DEVFILE="$STATE_DIR/device"
 TRANSCRIBING="$STATE_DIR/transcribing"
-LOG="${KEYBOUND_LOG:-$STATE_DIR/keybound-whisper.log}"
+LOG="${KEYBIND_LOG:-$STATE_DIR/keybind-whisper.log}"
 
 # Core utilities, pinned. All are in the restricted GUI PATH.
 DATE="/bin/date"; AWK="/usr/bin/awk"; SED="/usr/bin/sed"; TR="/usr/bin/tr"; PS="/bin/ps"
@@ -138,26 +138,26 @@ resolve_bin() {
     return 1
 }
 
-SOX="${KEYBOUND_SOX:-$(resolve_bin sox \
+SOX="${KEYBIND_SOX:-$(resolve_bin sox \
     /opt/homebrew/bin/sox /usr/local/bin/sox)}"
 
 # whisper.cpp's CLI is `whisper-cli`; older builds called it `main`.
-WHISPER="${KEYBOUND_WHISPER_BIN:-$(resolve_bin whisper-cli \
+WHISPER="${KEYBIND_WHISPER_BIN:-$(resolve_bin whisper-cli \
     /opt/homebrew/bin/whisper-cli /usr/local/bin/whisper-cli \
     "$HOME/code/whisper.cpp/build/bin/whisper-cli" \
     "$HOME/whisper.cpp/build/bin/whisper-cli" \
     "$HOME/src/whisper.cpp/build/bin/whisper-cli")}"
 
 # Optional: only used to name and list audio devices in `doctor`.
-SWITCHAUDIO="${KEYBOUND_SWITCHAUDIO:-$(resolve_bin SwitchAudioSource \
+SWITCHAUDIO="${KEYBIND_SWITCHAUDIO:-$(resolve_bin SwitchAudioSource \
     /opt/homebrew/bin/SwitchAudioSource /usr/local/bin/SwitchAudioSource)}"
 
 # Model discovery: an explicit setting wins, otherwise search the usual places
 # in descending order of quality so a fresh install just works.
 find_model() {
-    [ -n "${KEYBOUND_MODEL:-}" ] && { printf '%s\n' "$KEYBOUND_MODEL"; return 0; }
-    _dirs="${XDG_DATA_HOME:-$HOME/.local/share}/keybound-whisper/models
-$HOME/.local/share/keybound-whisper/models
+    [ -n "${KEYBIND_MODEL:-}" ] && { printf '%s\n' "$KEYBIND_MODEL"; return 0; }
+    _dirs="${XDG_DATA_HOME:-$HOME/.local/share}/keybind-whisper/models
+$HOME/.local/share/keybind-whisper/models
 $HOME/code/whisper.cpp/models
 $HOME/whisper.cpp/models
 $HOME/src/whisper.cpp/models
@@ -179,8 +179,8 @@ require_sox() {
     [ -n "$SOX" ] || die "sox not found. Install it: brew install sox"
 }
 require_whisper() {
-    [ -n "$WHISPER" ] || die "whisper-cli not found. Install whisper.cpp, or set KEYBOUND_WHISPER_BIN."
-    [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no whisper model found. Download one and set KEYBOUND_MODEL."
+    [ -n "$WHISPER" ] || die "whisper-cli not found. Install whisper.cpp, or set KEYBIND_WHISPER_BIN."
+    [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no whisper model found. Download one and set KEYBIND_MODEL."
 }
 
 # ── Recorder process management ─────────────────────────────────────────────
@@ -328,7 +328,7 @@ history_line_at() {
 # Join the vocabulary into one comma-separated initial prompt. whisper caps the
 # prompt at n_text_ctx/2 tokens, so an oversized list is truncated rather than
 # silently rejected by the model.
-VOCAB_PROMPT_MAX="${KEYBOUND_VOCAB_PROMPT_MAX:-800}"
+VOCAB_PROMPT_MAX="${KEYBIND_VOCAB_PROMPT_MAX:-800}"
 vocab_prompt() {
     [ -f "$VOCAB_FILE" ] || return 0
     _vp="$("$SED" -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$VOCAB_FILE" \
@@ -476,7 +476,7 @@ transcribe_wav() {
     # peak: a dead capture still throws transients past a peak floor, but its
     # RMS stays around 0.00005 while real speech is above 0.002.
     if "$AWK" "BEGIN{exit !(($_peak) < ($PEAK_MIN) || ($_rms) < ($RMS_MIN))}"; then
-        nothing "silent capture (peak=$_peak rms=$_rms, need peak>$PEAK_MIN rms>$RMS_MIN) — check the input device and microphone permission; run: keybound-whisper doctor"
+        nothing "silent capture (peak=$_peak rms=$_rms, need peak>$PEAK_MIN rms>$RMS_MIN) — check the input device and microphone permission; run: keybind-whisper doctor"
     fi
 
     # Peak-normalize quiet-but-real audio to about -1 dBFS so a low-gain mic
@@ -584,7 +584,7 @@ cmd_stop() {
 # recorder to finish on its own. It ends when any of these happens:
 #   - speech stops for SILENCE_SEC (when auto-stop is enabled)
 #   - MAX_SEC is reached
-#   - `keybound-whisper finish` signals the recorder from elsewhere
+#   - `keybind-whisper finish` signals the recorder from elsewhere
 cmd_dictate() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -636,7 +636,7 @@ cmd_toggle() {
 }
 
 cmd_transcribe() {
-    [ -n "${1:-}" ] || die "usage: keybound-whisper transcribe FILE"
+    [ -n "${1:-}" ] || die "usage: keybind-whisper transcribe FILE"
     [ -f "$1" ] || die "no such file: $1"
     require_sox
     require_whisper
@@ -660,7 +660,7 @@ cmd_replace() {
 }
 
 cmd_status() {
-    printf 'keybound-whisper %s\n\n' "$KEYBOUND_VERSION"
+    printf 'keybind-whisper %s\n\n' "$KEYBIND_VERSION"
     printf '  sox       %s\n' "${SOX:-NOT FOUND}"
     printf '  whisper   %s\n' "${WHISPER:-NOT FOUND}"
     printf '  model     %s\n' "${MODEL:-NOT FOUND}"
@@ -692,9 +692,9 @@ cmd_doctor() {
     if [ -n "$SOX" ]; then printf '  ok    sox       %s\n' "$SOX"
     else printf '  FAIL  sox not found — brew install sox\n'; _rc=1; fi
     if [ -n "$WHISPER" ]; then printf '  ok    whisper   %s\n' "$WHISPER"
-    else printf '  FAIL  whisper-cli not found — build whisper.cpp or set KEYBOUND_WHISPER_BIN\n'; _rc=1; fi
+    else printf '  FAIL  whisper-cli not found — build whisper.cpp or set KEYBIND_WHISPER_BIN\n'; _rc=1; fi
     if [ -n "$MODEL" ] && [ -f "$MODEL" ]; then printf '  ok    model     %s\n' "$MODEL"
-    else printf '  FAIL  no model found — set KEYBOUND_MODEL\n'; _rc=1; fi
+    else printf '  FAIL  no model found — set KEYBIND_MODEL\n'; _rc=1; fi
 
     printf '\nAudio input\n'
     if [ -n "$SWITCHAUDIO" ]; then
@@ -724,7 +724,7 @@ cmd_doctor() {
     if "$AWK" "BEGIN{exit !(($1) < ($PEAK_MIN) || ($2) < ($RMS_MIN))}"; then
         printf '  FAIL  this input reads as dead (need peak>%s rms>%s).\n' "$PEAK_MIN" "$RMS_MIN"
         printf '        - Check System Settings > Privacy & Security > Microphone and\n'
-        printf '          make sure the app that launches keybound-whisper is allowed.\n'
+        printf '          make sure the app that launches keybind-whisper is allowed.\n'
         printf '        - Check System Settings > Sound > Input and pick a working device.\n'
         printf '        - Bluetooth headsets often expose a silent input until macOS\n'
         printf '          switches them to their headset profile; try a wired or built-in mic.\n'
@@ -742,7 +742,7 @@ cmd_doctor() {
             if (pct > 0.2) {
                 rec = pct / 4
                 if (rec < 0.3) rec = 0.3
-                printf "  for auto-stop, try: KEYBOUND_SILENCE_THRESHOLD=\"%.1f%%\"\n", rec
+                printf "  for auto-stop, try: KEYBIND_SILENCE_THRESHOLD=\"%.1f%%\"\n", rec
             }
         }'
 
@@ -770,7 +770,7 @@ cmd_history() {
         list|"")
             history_require
             _n="${1:-20}"
-            case "$_n" in ''|*[!0-9]*) die "usage: keybound-whisper history list [COUNT]" ;; esac
+            case "$_n" in ''|*[!0-9]*) die "usage: keybind-whisper history list [COUNT]" ;; esac
             # Numbered newest-first, so the index matches `history show N`.
             tail -n "$_n" "$HISTORY_FILE" | "$AWK" "$AWK_UNESCAPE"'
                 { lines[NR] = $0 }
@@ -818,7 +818,7 @@ cmd_history() {
 
         search)
             history_require
-            [ -n "${1:-}" ] || die "usage: keybound-whisper history search QUERY"
+            [ -n "${1:-}" ] || die "usage: keybind-whisper history search QUERY"
             # Case-insensitive substring match against the transcript text only,
             # so metadata fields cannot produce spurious hits.
             "$AWK" -v q="$1" "$AWK_UNESCAPE"'
@@ -869,7 +869,7 @@ cmd_history() {
             # Destructive and unrecoverable, so require an explicit --yes rather
             # than prompting: this is often run from a hotkey with no terminal.
             if [ "${1:-}" != "--yes" ]; then
-                die "this deletes $_count stored transcriptions permanently. Re-run: keybound-whisper history clear --yes"
+                die "this deletes $_count stored transcriptions permanently. Re-run: keybind-whisper history clear --yes"
             fi
             rm -f "$HISTORY_FILE"
             printf 'deleted %s stored transcriptions\n' "$_count" >&2
@@ -883,31 +883,31 @@ cmd_history() {
 
 usage() {
     cat <<'USAGE'
-keybound-whisper — offline push-to-talk dictation for macOS
+keybind-whisper — offline push-to-talk dictation for macOS
 
-  keybound-whisper start               begin recording
-  keybound-whisper stop                finish recording, print the transcript
-  keybound-whisper toggle              start if idle, stop if recording
-  keybound-whisper dictate [--silence N]
+  keybind-whisper start               begin recording
+  keybind-whisper stop                finish recording, print the transcript
+  keybind-whisper toggle              start if idle, stop if recording
+  keybind-whisper dictate [--silence N]
                                     record until you stop speaking, then print
-  keybound-whisper finish              end a recording without transcribing it
-  keybound-whisper transcribe FILE     transcribe an existing audio file
+  keybind-whisper finish              end a recording without transcribing it
+  keybind-whisper transcribe FILE     transcribe an existing audio file
 
-  keybound-whisper history [list [N]]  recent transcriptions, newest first
-  keybound-whisper history show N      print entry N in full (1 = most recent)
-  keybound-whisper history last        print the most recent transcription
-  keybound-whisper history copy [N]    copy entry N to the clipboard
-  keybound-whisper history search Q    find past transcriptions containing Q
-  keybound-whisper history add TEXT    record a transcription from elsewhere
-  keybound-whisper replace TEXT        preview your replacement rules on TEXT
-  keybound-whisper history stats       how much has been dictated
-  keybound-whisper history export      raw JSONL on stdout
-  keybound-whisper history path        where history is stored
-  keybound-whisper history clear --yes delete all stored transcriptions
+  keybind-whisper history [list [N]]  recent transcriptions, newest first
+  keybind-whisper history show N      print entry N in full (1 = most recent)
+  keybind-whisper history last        print the most recent transcription
+  keybind-whisper history copy [N]    copy entry N to the clipboard
+  keybind-whisper history search Q    find past transcriptions containing Q
+  keybind-whisper history add TEXT    record a transcription from elsewhere
+  keybind-whisper replace TEXT        preview your replacement rules on TEXT
+  keybind-whisper history stats       how much has been dictated
+  keybind-whisper history export      raw JSONL on stdout
+  keybind-whisper history path        where history is stored
+  keybind-whisper history clear --yes delete all stored transcriptions
 
-  keybound-whisper status              current state and resolved configuration
-  keybound-whisper doctor              check dependencies and test the microphone
-  keybound-whisper version             print the version
+  keybind-whisper status              current state and resolved configuration
+  keybind-whisper doctor              check dependencies and test the microphone
+  keybind-whisper version             print the version
 
 Audio is captured from the system default input and transcribed locally.
 Nothing leaves the machine.
@@ -925,7 +925,7 @@ case "${1:-}" in
     replace)     shift; cmd_replace "${1:-}" ;;
     status)      cmd_status ;;
     doctor)      cmd_doctor ;;
-    version|--version|-v) printf 'keybound-whisper %s\n' "$KEYBOUND_VERSION" ;;
+    version|--version|-v) printf 'keybind-whisper %s\n' "$KEYBIND_VERSION" ;;
     help|--help|-h) usage ;;
     *)           usage >&2; exit 2 ;;
 esac

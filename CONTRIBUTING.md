@@ -3,9 +3,9 @@
 ## Getting set up
 
 ```sh
-git clone https://github.com/samhaaf/keybound-whisper
-cd keybound-whisper
-./bin/keybound-whisper doctor     # confirms dependencies and the microphone
+git clone https://github.com/samhaaf/keybind-whisper
+cd keybind-whisper
+./bin/keybind-whisper doctor     # confirms dependencies and the microphone
 ./test/run-tests.sh            # no microphone needed
 ```
 

@@ -1,6 +1,6 @@
-# keybound-whisper configuration
+# keybind-whisper configuration
 #
-# Copy to ~/.config/keybound-whisper/config and edit. This file is sourced by the
+# Copy to ~/.config/keybind-whisper/config and edit. This file is sourced by the
 # shell, so use `name=value`. Every setting is optional: the defaults below are
 # what the tool uses when the file is absent. Environment variables override it.
 
@@ -9,48 +9,48 @@
 # default input. This is the recommended setting: dictation then follows the
 # device you pick in System Settings > Sound, like any other app.
 # Set it only to pin one specific device regardless of the system default. Use
-# the exact name shown by `keybound-whisper doctor`.
-# KEYBOUND_DEVICE="USB Audio CODEC"
+# the exact name shown by `keybind-whisper doctor`.
+# KEYBIND_DEVICE="USB Audio CODEC"
 
 # ── Model and language ──────────────────────────────────────────────────────
 # By default the newest, highest-quality ggml model found in the usual
 # whisper.cpp locations is used. Set this to pin a specific one.
-# KEYBOUND_MODEL="$HOME/.local/share/keybound-whisper/models/ggml-large-v3-turbo.bin"
+# KEYBIND_MODEL="$HOME/.local/share/keybind-whisper/models/ggml-large-v3-turbo.bin"
 
 # Spoken language, as an ISO 639-1 code. Use "auto" to detect it per recording,
 # at some cost in accuracy and speed.
-# KEYBOUND_LANG="en"
+# KEYBIND_LANG="en"
 
 # Decoding threads. Defaults to whisper.cpp's own choice.
-# KEYBOUND_THREADS="8"
+# KEYBIND_THREADS="8"
 
 # ── Silence detection ───────────────────────────────────────────────────────
 # A capture below BOTH of these is treated as silence and never sent to the
 # model, because whisper invents plausible filler when given silent audio.
 # Lower them if a genuinely quiet microphone is being rejected; raise them if
-# room noise is getting transcribed. `keybound-whisper doctor` prints the levels
+# room noise is getting transcribed. `keybind-whisper doctor` prints the levels
 # your microphone actually produces.
-# KEYBOUND_PEAK_MIN="0.0008"
-# KEYBOUND_RMS_MIN="0.0006"
+# KEYBIND_PEAK_MIN="0.0008"
+# KEYBIND_RMS_MIN="0.0006"
 
 # ── Limits ──────────────────────────────────────────────────────────────────
 # Captures shorter than this are treated as a fumbled keypress, in seconds.
-# KEYBOUND_MIN_SEC="0.30"
+# KEYBIND_MIN_SEC="0.30"
 
 # Recording stops on its own after this many seconds, so a forgotten recording
 # cannot fill the disk.
-# KEYBOUND_MAX_SEC="1800"
+# KEYBIND_MAX_SEC="1800"
 
 # ── Auto-stop on silence ────────────────────────────────────────────────────
 # Seconds of silence that end a recording. 0 (the default) means push-to-talk:
 # recording ends when you say it does.
-# KEYBOUND_SILENCE_SEC="0"
+# KEYBIND_SILENCE_SEC="0"
 
 # Amplitude below which audio counts as silence, as a percentage of full scale.
 # It has to sit above your room noise and below your speech: too high and quiet
 # speech never registers, too low and room noise never counts as a pause. Run
-# `keybound-whisper doctor` — it measures both and recommends a value.
-# KEYBOUND_SILENCE_THRESHOLD="2%"
+# `keybind-whisper doctor` — it measures both and recommends a value.
+# KEYBIND_SILENCE_THRESHOLD="2%"
 
 # ── Vocabulary and replacements ─────────────────────────────────────────────
 # Two files, both optional, fixing different failures.
@@ -63,10 +63,10 @@
 #              case-insensitive, whole-word. Rules are tried in file order and
 #              the first match wins, so list longer phrases before shorter ones
 #              they contain. An empty replacement deletes the term.
-#              Preview with: keybound-whisper replace "some text"
+#              Preview with: keybind-whisper replace "some text"
 #
-# KEYBOUND_VOCAB_FILE="$HOME/.config/keybound-whisper/vocabulary"
-# KEYBOUND_REPLACEMENTS_FILE="$HOME/.config/keybound-whisper/replacements"
+# KEYBIND_VOCAB_FILE="$HOME/.config/keybind-whisper/vocabulary"
+# KEYBIND_REPLACEMENTS_FILE="$HOME/.config/keybind-whisper/replacements"
 
 # ── History ─────────────────────────────────────────────────────────────────
 # Every successful transcription is stored so it can be searched and reused.
@@ -74,15 +74,15 @@
 # inside a 0700 directory and never leaves the machine.
 
 # Set to 0 to store nothing at all. No file is created.
-# KEYBOUND_HISTORY="1"
+# KEYBIND_HISTORY="1"
 
-# KEYBOUND_HISTORY_FILE="$HOME/.local/share/keybound-whisper/history.jsonl"
+# KEYBIND_HISTORY_FILE="$HOME/.local/share/keybind-whisper/history.jsonl"
 
 # Entries kept before the oldest are dropped.
-# KEYBOUND_HISTORY_MAX="1000"
+# KEYBIND_HISTORY_MAX="1000"
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 # Override only if the tool cannot find these on its own.
-# KEYBOUND_SOX="/opt/homebrew/bin/sox"
-# KEYBOUND_WHISPER_BIN="$HOME/code/whisper.cpp/build/bin/whisper-cli"
-# KEYBOUND_LOG="$HOME/Library/Logs/keybound-whisper.log"
+# KEYBIND_SOX="/opt/homebrew/bin/sox"
+# KEYBIND_WHISPER_BIN="$HOME/code/whisper.cpp/build/bin/whisper-cli"
+# KEYBIND_LOG="$HOME/Library/Logs/keybind-whisper.log"

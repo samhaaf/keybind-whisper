@@ -14,25 +14,25 @@ jobs:
 
       - name: Check bash syntax
         run: |
-          for f in bin/keybound-whisper install.sh test/run-tests.sh; do
+          for f in bin/keybind-whisper install.sh test/run-tests.sh; do
             bash -n "$f" && echo "ok  $f"
           done
 
       # The script targets bash 3.2, the version macOS ships. Linting against
       # that dialect catches syntax a newer bash would accept silently.
       - name: Check bash 3.2 compatibility
-        run: /bin/bash --version | head -1 && /bin/bash -n bin/keybound-whisper
+        run: /bin/bash --version | head -1 && /bin/bash -n bin/keybind-whisper
 
       - name: Shellcheck
         run: |
           brew install shellcheck
-          shellcheck --shell=bash --severity=warning bin/keybound-whisper install.sh
+          shellcheck --shell=bash --severity=warning bin/keybind-whisper install.sh
           shellcheck --shell=bash --severity=warning test/run-tests.sh
 
       - name: Check Lua syntax
         run: |
           brew install lua
-          luac -p hammerspoon/keybound-whisper.lua && echo "ok  hammerspoon/keybound-whisper.lua"
+          luac -p hammerspoon/keybind-whisper.lua && echo "ok  hammerspoon/keybind-whisper.lua"
 
       # Loads the Lua module against a stubbed Hammerspoon API. Catches the
       # scoping and dispatch bugs that otherwise only appear on a hotkey press.

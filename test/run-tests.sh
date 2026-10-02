@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run-tests.sh — conformance tests for keybound-whisper.
+# run-tests.sh — conformance tests for keybind-whisper.
 #
 # Every test runs with PATH reduced to /usr/bin:/bin:/usr/sbin:/sbin, which is
 # what macOS gives a process launched by a GUI app. That is not incidental: a
@@ -15,18 +15,18 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CLI="$ROOT/bin/keybound-whisper"
+CLI="$ROOT/bin/keybind-whisper"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # The restricted environment a GUI-launched process actually gets.
 run() {
     env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-        KEYBOUND_STATE_DIR="$WORK/state" \
-        KEYBOUND_CONFIG="$WORK/nonexistent-config" \
-        KEYBOUND_HISTORY_FILE="$WORK/history.jsonl" \
-        KEYBOUND_VOCAB_FILE="$WORK/vocabulary" \
-        KEYBOUND_REPLACEMENTS_FILE="$WORK/replacements" \
+        KEYBIND_STATE_DIR="$WORK/state" \
+        KEYBIND_CONFIG="$WORK/nonexistent-config" \
+        KEYBIND_HISTORY_FILE="$WORK/history.jsonl" \
+        KEYBIND_VOCAB_FILE="$WORK/vocabulary" \
+        KEYBIND_REPLACEMENTS_FILE="$WORK/replacements" \
         "$CLI" "$@"
 }
 
@@ -39,7 +39,7 @@ check() { # check <name> <condition-result> <detail>
 
 SOX="$(command -v sox || echo /opt/homebrew/bin/sox)"
 
-printf '\nkeybound-whisper test suite\n'
+printf '\nkeybind-whisper test suite\n'
 printf 'PATH under test: /usr/bin:/bin:/usr/sbin:/sbin (GUI-launch equivalent)\n\n'
 
 # ── Dependency resolution ───────────────────────────────────────────────────
@@ -220,12 +220,12 @@ check "clear --yes removes the store" \
 
 # Opting out must mean nothing is written at all.
 env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-    KEYBOUND_STATE_DIR="$WORK/state" \
-    KEYBOUND_CONFIG="$WORK/nonexistent-config" \
-    KEYBOUND_HISTORY_FILE="$WORK/optout.jsonl" \
-    KEYBOUND_HISTORY=0 \
+    KEYBIND_STATE_DIR="$WORK/state" \
+    KEYBIND_CONFIG="$WORK/nonexistent-config" \
+    KEYBIND_HISTORY_FILE="$WORK/optout.jsonl" \
+    KEYBIND_HISTORY=0 \
     "$CLI" history add "must not be stored" >/dev/null 2>&1
-check "KEYBOUND_HISTORY=0 writes nothing" \
+check "KEYBIND_HISTORY=0 writes nothing" \
     "$([ ! -f "$WORK/optout.jsonl" ] && echo 0 || echo 1)" "a history file was created anyway"
 
 # ── Replacements ────────────────────────────────────────────────────────────
@@ -325,8 +325,8 @@ case "$out" in
 esac
 
 out="$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-    KEYBOUND_STATE_DIR="$WORK/state" KEYBOUND_CONFIG="$WORK/none" \
-    KEYBOUND_SILENCE_SEC=2 "$CLI" status 2>&1)"
+    KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" \
+    KEYBIND_SILENCE_SEC=2 "$CLI" status 2>&1)"
 case "$out" in
     *"auto-stop 2s below"*) ok "auto-stop is reported when enabled" ;;
     *) bad "auto-stop is reported when enabled" "$out" ;;
