@@ -1,0 +1,30 @@
+# whisper-local replacements
+#
+# One `find = replace` rule per line. Applied after transcription.
+#
+#   - Matching is literal: punctuation and characters like + or * mean
+#     themselves, not regex.
+#   - Matching is case-insensitive, and the replacement is used exactly as
+#     written here.
+#   - Only whole words match, so `arm = ARM` leaves `alarm` and `farm` alone.
+#   - Rules are tried in file order and the first match wins, so LIST LONGER
+#     PHRASES FIRST or the shorter one will claim the text.
+#   - A replacement is never rescanned by a later rule, so rules cannot
+#     cascade into one another.
+#   - An empty replacement deletes the term and reflows the spacing.
+#
+# Preview without recording:  whisper-local replace "some text"
+#
+# Copy to ~/.config/whisper-local/replacements and edit.
+
+# Spoken forms of things you write differently.
+arm sixty four = arm64
+kay eight s    = k8s
+post gres      = PostgreSQL
+java script    = JavaScript
+
+# Names the model does not know.
+hammer spoon   = Hammerspoon
+
+# Longer first: this would never match if `arm = ARM` came before it.
+arm            = ARM

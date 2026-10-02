@@ -17,6 +17,8 @@ No account, no network, no audio leaving the computer.
   module is a thin front end. Bind it to any hotkey daemon, or script it.
 - **Keeps what you dictated.** Every transcription is stored, searchable, and
   re-pastable — dictation you can go back to, not just a log file.
+- **Learns your words.** Proper nouns and jargon are biased toward during
+  decoding and corrected deterministically afterwards.
 
 ## Requirements
 
@@ -99,6 +101,76 @@ Scripts can rely on this:
 stdout is only ever the transcript, so it is safe to paste blind. Diagnostics
 go to stderr and to the log.
 
+## Getting your words right
+
+whisper reliably mangles proper nouns, product names and jargon, and no amount
+of audio tuning fixes it. Two mechanisms address this, because they fail
+differently.
+
+**Vocabulary** biases the model while it decodes. Put one term per line in
+`~/.config/whisper-local/vocabulary`:
+
+```
+arm64
+Kubernetes
+PostgreSQL
+```
+
+This works when the model is already close — "Postgres" becomes "PostgreSQL" —
+but it is a nudge, not a guarantee. When a word is acoustically far from the
+term you wanted, biasing will not rescue it.
+
+**Replacements** fix what the model gets wrong anyway, deterministically. Put
+`find = replace` lines in `~/.config/whisper-local/replacements`:
+
+```
+# comments and blank lines are ignored
+arm sixty four = arm64
+post gres      = PostgreSQL
+kay eight s    = k8s
+```
+
+Matching is literal, case-insensitive, and whole-word, so a rule for `arm`
+cannot rewrite the middle of `alarm`. Rules are tried in file order and the
+first match wins, so **list longer phrases before shorter ones they contain**.
+A replacement is never rescanned by a later rule, so rules cannot cascade into
+each other. An empty replacement deletes the term and reflows the spacing.
+
+Preview rules against any text without recording:
+
+```sh
+whisper-local replace "deploy the arm sixty four build"
+# deploy the arm64 build
+```
+
+## Stopping automatically
+
+By default dictation is push-to-talk: the hotkey starts it and the hotkey stops
+it. To end a recording once you stop speaking instead:
+
+```sh
+WHISPER_LOCAL_SILENCE_SEC=2 whisper-local dictate
+```
+
+or in Hammerspoon:
+
+```lua
+require("whisper-local").setup({
+    hotkey   = { { "alt" }, "space" },
+    autoStop = 2,   -- seconds of silence that end the recording
+})
+```
+
+The hotkey still ends a recording early. This is off by default because the
+silence threshold depends on your room and microphone: too high and quiet
+speech never registers, too low and room noise never counts as a pause.
+`whisper-local doctor` measures your actual levels and recommends a value:
+
+```
+  speech peaked at 34.20% of full scale
+  for auto-stop, try: WHISPER_LOCAL_SILENCE_THRESHOLD="8.6%"
+```
+
 ## History
 
 Every successful transcription is stored, so a dictation you lost to the wrong
@@ -175,6 +247,10 @@ Everything works unconfigured. To change something, copy
 | `WHISPER_LOCAL_HISTORY` | `1` | Set to `0` to store nothing |
 | `WHISPER_LOCAL_HISTORY_FILE` | `~/.local/share/whisper-local/history.jsonl` | Where history lives |
 | `WHISPER_LOCAL_HISTORY_MAX` | `1000` | Entries kept before the oldest are dropped |
+| `WHISPER_LOCAL_SILENCE_SEC` | `0` | Seconds of silence that end a recording; `0` disables |
+| `WHISPER_LOCAL_SILENCE_THRESHOLD` | `2%` | Amplitude below which audio counts as silence |
+| `WHISPER_LOCAL_VOCAB_FILE` | `~/.config/whisper-local/vocabulary` | Terms to bias decoding toward |
+| `WHISPER_LOCAL_REPLACEMENTS_FILE` | `~/.config/whisper-local/replacements` | Post-transcription fix-ups |
 
 Environment variables override the config file.
 
@@ -218,24 +294,28 @@ this does not, as of now:
 | Searchable history | yes | yes |
 | Cost | free, MIT | paid |
 | Scriptable CLI | yes | no |
+| Custom vocabulary and replacements | yes | yes |
+| Stop automatically on silence | yes | yes |
 | LLM cleanup of transcripts | no | yes |
-| Custom vocabulary and replacements | no | yes |
 | Streaming partial results | no | yes |
-| Stop automatically on silence | no | yes |
 | Per-application modes and prompts | no | yes |
 
-The gaps are real. Custom vocabulary is the one most likely to matter day to
-day: whisper reliably mangles proper nouns, product names and jargon, and no
-amount of audio tuning fixes that. Contributions welcome.
+The remaining gaps are real, and [ROADMAP.md](ROADMAP.md) says which are
+planned and which are deliberately not. The short version: per-application
+modes are next, streaming is a large rewrite for no gain in final accuracy, and
+LLM cleanup is the one feature genuinely at odds with "nothing leaves the
+machine".
 
 ## How it works
 
 ```
-hotkey ─▶ whisper-local start ─▶ sox ─▶ 16 kHz mono WAV
-hotkey ─▶ whisper-local stop  ─▶ silence gate ─▶ normalize ─▶ whisper.cpp
-                                                      │
-                                            stdout ─▶ paste
-                                                      └─▶ history.jsonl
+hotkey ─▶ start ─▶ sox ─▶ 16 kHz mono WAV          ◀── auto-stop ends this
+hotkey ─▶ stop  ─▶ silence gate ─▶ normalize ─▶ whisper.cpp ◀── vocabulary
+                                                   │
+                                          replacements
+                                                   │
+                                         stdout ─▶ paste
+                                                   └─▶ history.jsonl
 ```
 
 Recording is a backgrounded `sox` process writing 16 kHz mono 16-bit — whisper's
@@ -253,13 +333,31 @@ whisper can fall into on long audio. Non-speech annotations (`[BLANK_AUDIO]`,
 ./test/run-tests.sh
 ```
 
-Thirty-seven checks covering dependency resolution, the output contract, the
+Fifty-three checks covering dependency resolution, the output contract, the
 silence and duration gates, stale-state handling, history storage and
-retrieval, and a real end-to-end transcription.
+retrieval, the replacement matcher, auto-stop, and a real end-to-end
+transcription.
+
+The Lua module has its own harness, which loads it against a stubbed
+Hammerspoon API:
+
+```sh
+lua test/test-hammerspoon.lua
+```
+
+Hammerspoon only raises an error when the offending line actually runs, so a
+mistake like calling a helper declared further down the file stays invisible
+until someone presses the hotkey. This turns that into a test failure.
 
 No microphone is used: speech is synthesized to a file with `say -o`, which
 renders silently. Every test runs with `PATH` reduced to what a GUI-launched
 process gets, so the PATH class of bug cannot come back unnoticed.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and the two conventions that
+matter most here, and [ROADMAP.md](ROADMAP.md) for what is planned.
+[CHANGELOG.md](CHANGELOG.md) records what has changed.
 
 ## License
 

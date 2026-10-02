@@ -25,6 +25,8 @@ run() {
         WHISPER_LOCAL_STATE_DIR="$WORK/state" \
         WHISPER_LOCAL_CONFIG="$WORK/nonexistent-config" \
         WHISPER_LOCAL_HISTORY_FILE="$WORK/history.jsonl" \
+        WHISPER_LOCAL_VOCAB_FILE="$WORK/vocabulary" \
+        WHISPER_LOCAL_REPLACEMENTS_FILE="$WORK/replacements" \
         "$CLI" "$@"
 }
 
@@ -225,6 +227,142 @@ env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     "$CLI" history add "must not be stored" >/dev/null 2>&1
 check "WHISPER_LOCAL_HISTORY=0 writes nothing" \
     "$([ ! -f "$WORK/optout.jsonl" ] && echo 0 || echo 1)" "a history file was created anyway"
+
+# ── Replacements ────────────────────────────────────────────────────────────
+printf '\nreplacements\n'
+
+# With no rules file the text must pass through untouched, or every install
+# without a rules file would corrupt transcripts.
+check "text passes through with no rules file" \
+    "$([ "$(run replace 'hello world')" = "hello world" ] && echo 0 || echo 1)" \
+    "got: [$(run replace 'hello world')]"
+
+cat > "$WORK/replacements" <<'RULES'
+# comments and blank lines are ignored
+
+arm sixty four = arm64
+arm            = ARM
+kubernetes     = Kubernetes
+post gres      = PostgreSQL
+filler         =
+RULES
+
+r() { run replace "$1"; }
+check "a multi-word phrase is replaced" \
+    "$([ "$(r 'the arm sixty four runner')" = "the arm64 runner" ] && echo 0 || echo 1)" \
+    "got: [$(r 'the arm sixty four runner')]"
+check "matching is case-insensitive" \
+    "$([ "$(r 'KUBERNETES and kubernetes')" = "Kubernetes and Kubernetes" ] && echo 0 || echo 1)" \
+    "got: [$(r 'KUBERNETES and kubernetes')]"
+
+# The important safety property: a short rule must not rewrite the inside of a
+# longer word. Without a boundary check, "arm" would corrupt "alarm" and "farm".
+check "rules do not match inside words" \
+    "$([ "$(r 'an alarm on a farm')" = "an alarm on a farm" ] && echo 0 || echo 1)" \
+    "got: [$(r 'an alarm on a farm')]"
+check "rules match next to punctuation" \
+    "$([ "$(r 'arm, and arm.')" = "ARM, and ARM." ] && echo 0 || echo 1)" \
+    "got: [$(r 'arm, and arm.')]"
+check "every occurrence is replaced" \
+    "$([ "$(r 'post gres then post gres')" = "PostgreSQL then PostgreSQL" ] && echo 0 || echo 1)" \
+    "got: [$(r 'post gres then post gres')]"
+check "an earlier rule wins over a shorter later one" \
+    "$([ "$(r 'arm sixty four')" = "arm64" ] && echo 0 || echo 1)" \
+    "got: [$(r 'arm sixty four')]"
+check "an empty replacement deletes and reflows spacing" \
+    "$([ "$(r 'a filler b')" = "a b" ] && echo 0 || echo 1)" \
+    "got: [$(r 'a filler b')]"
+
+# A replacement must never be rescanned by a later rule, or rules could cascade
+# into each other unpredictably.
+cat > "$WORK/replacements" <<'RULES'
+cat = dog
+dog = ferret
+RULES
+check "a replacement is not rescanned by later rules" \
+    "$([ "$(r 'cat')" = "dog" ] && echo 0 || echo 1)" "got: [$(r 'cat')]"
+
+# Regex metacharacters in a rule must be treated literally.
+cat > "$WORK/replacements" <<'RULES'
+c++ = cpp
+RULES
+check "regex metacharacters are literal" \
+    "$([ "$(r 'I write c++ daily')" = "I write cpp daily" ] && echo 0 || echo 1)" \
+    "got: [$(r 'I write c++ daily')]"
+: > "$WORK/replacements"
+
+# ── Vocabulary ──────────────────────────────────────────────────────────────
+printf '\nvocabulary\n'
+cat > "$WORK/vocabulary" <<'VOCAB'
+# comments ignored
+arm64
+Kubernetes
+PostgreSQL
+VOCAB
+out="$(run status 2>&1)"
+case "$out" in
+    *"vocab     $WORK/vocabulary"*) ok "status reports the vocabulary file" ;;
+    *) bad "status reports the vocabulary file" "$out" ;;
+esac
+
+if command -v say >/dev/null 2>&1; then
+    say -o "$WORK/vocab.aiff" -r 175 "the kubernetes cluster runs postgres" 2>/dev/null
+    with="$(run transcribe "$WORK/vocab.aiff" 2>/dev/null)"
+    case "$with" in
+        *PostgreSQL*) ok "vocabulary biases decoding toward a listed term" ;;
+        # A nudge, not a guarantee: report it without failing the suite.
+        *) printf '  note vocabulary did not change this transcript: [%s]\n' "$with" ;;
+    esac
+fi
+: > "$WORK/vocabulary"
+
+# ── Auto-stop on silence ────────────────────────────────────────────────────
+printf '\nauto-stop\n'
+out="$(run status 2>&1)"
+case "$out" in
+    *"auto-stop off (push-to-talk)"*) ok "auto-stop is off by default" ;;
+    *) bad "auto-stop is off by default" "$out" ;;
+esac
+
+out="$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    WHISPER_LOCAL_STATE_DIR="$WORK/state" WHISPER_LOCAL_CONFIG="$WORK/none" \
+    WHISPER_LOCAL_SILENCE_SEC=2 "$CLI" status 2>&1)"
+case "$out" in
+    *"auto-stop 2s below"*) ok "auto-stop is reported when enabled" ;;
+    *) bad "auto-stop is reported when enabled" "$out" ;;
+esac
+
+run finish >/dev/null 2>&1; rc=$?
+check "finish with no recording exits non-zero" \
+    "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc"
+
+# The silence effect is what makes auto-stop work, so verify sox actually ends
+# a stream on trailing silence rather than trusting the flag is accepted.
+# Built from files, so no microphone is involved.
+say -o "$WORK/sp.aiff" -r 175 "this is a test of silence detection" 2>/dev/null
+"$SOX" "$WORK/sp.aiff" -r 16000 -c 1 -b 16 "$WORK/sp.wav" 2>/dev/null
+"$SOX" -n -r 16000 -c 1 -b 16 "$WORK/tone.wav" synth 5 whitenoise vol 0.002 2>/dev/null
+"$SOX" "$WORK/tone.wav" "$WORK/sp.wav" "$WORK/tone.wav" "$WORK/long.wav" 2>/dev/null
+"$SOX" "$WORK/long.wav" "$WORK/cut.wav" silence 1 0.1 2% 1 2.0 2% 2>/dev/null
+long="$("$SOX" --i -D "$WORK/long.wav" 2>/dev/null)"
+cut="$("$SOX" --i -D "$WORK/cut.wav" 2>/dev/null)"
+check "the silence effect ends a stream on trailing silence" \
+    "$(awk -v a="$long" -v b="$cut" 'BEGIN{exit !(b > 0.5 && b < a - 3)}' && echo 0 || echo 1)" \
+    "input ${long}s produced ${cut}s; expected a substantial cut"
+
+# ── Hammerspoon module ──────────────────────────────────────────────────────
+if command -v lua >/dev/null 2>&1; then
+    if lua "$ROOT/test/test-hammerspoon.lua" > "$WORK/lua.out" 2>&1; then
+        n="$(grep -c '^  ok' "$WORK/lua.out" || echo 0)"
+        printf '\nhammerspoon module\n'
+        ok "module loads and dispatches correctly ($n checks)"
+    else
+        printf '\nhammerspoon module\n'
+        bad "module tests failed" "$(cat "$WORK/lua.out")"
+    fi
+else
+    printf '\nhammerspoon module\n  skip lua unavailable; run test/test-hammerspoon.lua under Hammerspoon\n'
+fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 printf '\n%d passed, %d failed\n\n' "$PASS" "$FAIL"

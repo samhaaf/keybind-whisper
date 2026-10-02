@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check bash syntax
+        run: |
+          for f in bin/whisper-local install.sh test/run-tests.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+
+      # The script targets bash 3.2, the version macOS ships. Linting against
+      # that dialect catches syntax a newer bash would accept silently.
+      - name: Check bash 3.2 compatibility
+        run: /bin/bash --version | head -1 && /bin/bash -n bin/whisper-local
+
+      - name: Shellcheck
+        run: |
+          brew install shellcheck
+          shellcheck --shell=bash --severity=warning bin/whisper-local install.sh
+          shellcheck --shell=bash --severity=warning test/run-tests.sh
+
+      - name: Check Lua syntax
+        run: |
+          brew install lua
+          luac -p hammerspoon/whisper-local.lua && echo "ok  hammerspoon/whisper-local.lua"
+
+      # Loads the Lua module against a stubbed Hammerspoon API. Catches the
+      # scoping and dispatch bugs that otherwise only appear on a hotkey press.
+      - name: Hammerspoon module tests
+        run: lua test/test-hammerspoon.lua
+
+  # The full suite transcribes real audio, so it needs whisper.cpp and a model.
+  # That is a large download; run it on demand rather than on every push.
+  integration:
+    runs-on: macos-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install sox
+      - name: Build whisper.cpp and fetch a small model
+        run: |
+          git clone --depth 1 https://github.com/ggerganov/whisper.cpp ~/whisper.cpp
+          cd ~/whisper.cpp
+          cmake -B build && cmake --build build -j --config Release
+          ./models/download-ggml-model.sh base.en
+      - name: Run the suite
+        run: ./test/run-tests.sh

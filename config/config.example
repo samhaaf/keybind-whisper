@@ -41,6 +41,33 @@
 # cannot fill the disk.
 # WHISPER_LOCAL_MAX_SEC="1800"
 
+# ── Auto-stop on silence ────────────────────────────────────────────────────
+# Seconds of silence that end a recording. 0 (the default) means push-to-talk:
+# recording ends when you say it does.
+# WHISPER_LOCAL_SILENCE_SEC="0"
+
+# Amplitude below which audio counts as silence, as a percentage of full scale.
+# It has to sit above your room noise and below your speech: too high and quiet
+# speech never registers, too low and room noise never counts as a pause. Run
+# `whisper-local doctor` — it measures both and recommends a value.
+# WHISPER_LOCAL_SILENCE_THRESHOLD="2%"
+
+# ── Vocabulary and replacements ─────────────────────────────────────────────
+# Two files, both optional, fixing different failures.
+#
+# vocabulary   one term per line, fed to the model as an initial prompt so
+#              decoding leans toward your proper nouns and jargon. Works when
+#              the model is close; it is a nudge, not a guarantee.
+#
+# replacements `find = replace` per line, applied after transcription. Literal,
+#              case-insensitive, whole-word. Rules are tried in file order and
+#              the first match wins, so list longer phrases before shorter ones
+#              they contain. An empty replacement deletes the term.
+#              Preview with: whisper-local replace "some text"
+#
+# WHISPER_LOCAL_VOCAB_FILE="$HOME/.config/whisper-local/vocabulary"
+# WHISPER_LOCAL_REPLACEMENTS_FILE="$HOME/.config/whisper-local/replacements"
+
 # ── History ─────────────────────────────────────────────────────────────────
 # Every successful transcription is stored so it can be searched and reused.
 # This is dictated text, so treat the file as sensitive: it is written 0600

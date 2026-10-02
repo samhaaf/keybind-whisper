@@ -74,6 +74,27 @@ HISTORY_FILE="${WHISPER_LOCAL_HISTORY_FILE:-$DATA_HOME/whisper-local/history.jso
 # Entries kept. Older ones are dropped as new ones arrive.
 HISTORY_MAX="${WHISPER_LOCAL_HISTORY_MAX:-1000}"
 
+# ── Auto-stop on silence ────────────────────────────────────────────────────
+# Seconds of silence that end a recording. 0 disables it, which is the default:
+# the tool is push-to-talk, so recording normally ends when you say it does.
+# When enabled, `dictate` records until you stop speaking.
+SILENCE_SEC="${WHISPER_LOCAL_SILENCE_SEC:-0}"
+# Amplitude below which audio counts as silence, as a percentage of full scale.
+# Must sit above your room noise and below your speech. `doctor` measures both
+# and prints a recommendation.
+SILENCE_THRESHOLD="${WHISPER_LOCAL_SILENCE_THRESHOLD:-2%}"
+
+# ── Vocabulary and replacements ─────────────────────────────────────────────
+# Two separate mechanisms, because they fix different failures.
+#
+# vocabulary   terms fed to the model as an initial prompt, which biases
+#              decoding toward them. Catches proper nouns before they are
+#              mistranscribed, but is a nudge, not a guarantee.
+# replacements literal find-and-replace applied after transcription. Catches
+#              what the model gets wrong anyway, deterministically.
+VOCAB_FILE="${WHISPER_LOCAL_VOCAB_FILE:-$CONFIG_HOME/whisper-local/vocabulary}"
+REPLACEMENTS_FILE="${WHISPER_LOCAL_REPLACEMENTS_FILE:-$CONFIG_HOME/whisper-local/replacements}"
+
 # Per-user state directory. Not $TMPDIR: macOS gives each process context a
 # different private $TMPDIR, so `start` and `stop` would not agree on a path.
 STATE_DIR="${WHISPER_LOCAL_STATE_DIR:-/tmp/whisper-local-$(id -u)}"
@@ -84,6 +105,7 @@ WAV="$STATE_DIR/capture.wav"
 NORM="$STATE_DIR/capture.norm.wav"
 PIDFILE="$STATE_DIR/recorder.pid"
 DEVFILE="$STATE_DIR/device"
+TRANSCRIBING="$STATE_DIR/transcribing"
 LOG="${WHISPER_LOCAL_LOG:-$STATE_DIR/whisper-local.log}"
 
 # Core utilities, pinned. All are in the restricted GUI PATH.
@@ -302,6 +324,97 @@ history_line_at() {
     tail -n "$_n" "$HISTORY_FILE" | head -n 1
 }
 
+# ── Vocabulary biasing ──────────────────────────────────────────────────────
+# Join the vocabulary into one comma-separated initial prompt. whisper caps the
+# prompt at n_text_ctx/2 tokens, so an oversized list is truncated rather than
+# silently rejected by the model.
+VOCAB_PROMPT_MAX="${WHISPER_LOCAL_VOCAB_PROMPT_MAX:-800}"
+vocab_prompt() {
+    [ -f "$VOCAB_FILE" ] || return 0
+    _vp="$("$SED" -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$VOCAB_FILE" \
+        | "$AWK" 'NF { terms = terms (terms ? ", " : "") $0 } END { print terms }')"
+    [ -n "$_vp" ] || return 0
+    if [ "${#_vp}" -gt "$VOCAB_PROMPT_MAX" ]; then
+        _vp="$(printf '%s' "$_vp" | cut -c "1-$VOCAB_PROMPT_MAX")"
+        log "vocabulary: truncated the prompt to $VOCAB_PROMPT_MAX characters"
+    fi
+    # Framed as a sentence rather than passed as a bare comma list. whisper
+    # imitates the prompt's style, so an unpunctuated fragment can cost you
+    # capitalization and punctuation in the transcript; a well-formed sentence
+    # biases the vocabulary without dragging the style along with it.
+    printf 'The following terms may appear: %s.' "$_vp"
+}
+
+# ── Replacements ────────────────────────────────────────────────────────────
+# Rules are `find = replace`, one per line, # for comments. Matching is literal
+# and case-insensitive, and only fires on whole words, so a rule for "arm" can
+# never rewrite the middle of "alarm". Literal rather than regex matching keeps
+# the file safe to edit without knowing regex syntax; regex support is tracked
+# in ROADMAP.md.
+apply_replacements() {
+    _rtext="$1"
+    [ -s "$REPLACEMENTS_FILE" ] || { printf '%s' "$_rtext"; return 0; }
+    printf '%s' "$_rtext" | "$AWK" -v rulefile="$REPLACEMENTS_FILE" '
+        function is_word(c) { return c ~ /[A-Za-z0-9]/ }
+
+        # Single left-to-right pass. At each position the rules are tried in
+        # file order and the first whole-word match wins; the replacement is
+        # emitted and the cursor jumps past the matched SOURCE text, so a
+        # replacement is never re-examined. That matters: applying rules one
+        # after another over the whole string instead would let them cascade,
+        # so "cat = dog" followed by "dog = ferret" would yield "ferret" and
+        # adding a rule could silently break an existing one.
+        #
+        # Matching uses substr() against a lowercased copy rather than a regex,
+        # which makes it literal and case-insensitive: punctuation and regex
+        # metacharacters in a rule mean exactly the characters they are.
+        function apply_rules(text,   lt, out, pos, L, j, flen, before, after, ap, hit) {
+            lt = tolower(text); L = length(text); out = ""; pos = 1
+            while (pos <= L) {
+                hit = 0
+                for (j = 1; j <= n; j++) {
+                    flen = flens[j]
+                    if (flen == 0 || substr(lt, pos, flen) != lfinds[j]) continue
+                    before = (pos == 1) ? "" : substr(text, pos - 1, 1)
+                    ap = pos + flen
+                    after = (ap > L) ? "" : substr(text, ap, 1)
+                    if ((before == "" || !is_word(before)) && (after == "" || !is_word(after))) {
+                        out = out repls[j]; pos += flen; hit = 1
+                        break
+                    }
+                }
+                if (!hit) { out = out substr(text, pos, 1); pos++ }
+            }
+            return out
+        }
+
+        BEGIN {
+            n = 0
+            while ((getline line < rulefile) > 0) {
+                sub(/#.*$/, "", line)
+                if (line !~ /=/) continue
+                eq = index(line, "=")
+                f = substr(line, 1, eq - 1)
+                r = substr(line, eq + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", f)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", r)
+                if (f == "") continue
+                n++; lfinds[n] = tolower(f); flens[n] = length(f); repls[n] = r
+            }
+            close(rulefile)
+        }
+
+        {
+            out = apply_rules($0)
+            # A rule whose replacement is empty leaves a gap behind, so
+            # re-flatten whitespace the same way the raw transcript was.
+            gsub(/[ \t]+/, " ", out)
+            gsub(/^ +| +$/, "", out)
+            printf "%s", out
+        }
+    '
+}
+
 history_text_at() {
     # die() inside a command substitution only exits the subshell, so the
     # failure has to be propagated explicitly or an invalid index would print
@@ -313,17 +426,31 @@ history_text_at() {
 # Start sox in the background writing 16 kHz mono 16-bit — whisper's native
 # format, so no resampling happens later. An empty $DEVICE means `-d`, the
 # system default input.
+# Sets REC_PID rather than printing it: a command substitution would put the
+# background job inside a subshell, and `wait` in cmd_dictate could not reach it.
+REC_PID=""
 spawn_recorder() {
+    # Effect chain. `trim 0 MAX_SEC` is the runaway guard. When auto-stop is on,
+    # `silence` also ends the recording once speech stops: the first triple is
+    # "begin after 0.1s above threshold", the second is "stop after SILENCE_SEC
+    # below threshold". It trims the surrounding silence too, which is what we
+    # want — whisper invents filler when handed leading silence.
+    set -- trim 0 "$MAX_SEC"
+    if [ "$SILENCE_SEC" != "0" ]; then
+        set -- "$@" silence 1 0.1 "$SILENCE_THRESHOLD" 1 "$SILENCE_SEC" "$SILENCE_THRESHOLD"
+        log "auto-stop armed: ${SILENCE_SEC}s below $SILENCE_THRESHOLD"
+    fi
+
     if [ -n "$DEVICE" ]; then
         log "capturing from device: $DEVICE"
-        "$SOX" -q -t coreaudio "$DEVICE" -r 16000 -c 1 -b 16 "$WAV" trim 0 "$MAX_SEC" \
+        "$SOX" -q -t coreaudio "$DEVICE" -r 16000 -c 1 -b 16 "$WAV" "$@" \
             </dev/null >>"$LOG" 2>&1 &
     else
         log "capturing from: system default input"
-        "$SOX" -q -d -r 16000 -c 1 -b 16 "$WAV" trim 0 "$MAX_SEC" \
+        "$SOX" -q -d -r 16000 -c 1 -b 16 "$WAV" "$@" \
             </dev/null >>"$LOG" 2>&1 &
     fi
-    printf '%s\n' "$!"
+    REC_PID="$!"
 }
 
 # Shared back half of `stop` and `transcribe`: gate, normalize, transcribe,
@@ -333,6 +460,7 @@ transcribe_wav() {
     _src="$1"
     _label="${2:-audio}"
 
+    # shellcheck disable=SC2046  # splitting is intended: measure() emits 3 fields
     set -- $(measure "$_src")
     _peak="$1"; _rms="$2"; _secs="$3"
     log "$_label: ${_secs}s peak=$_peak rms=$_rms"
@@ -364,6 +492,13 @@ transcribe_wav() {
     # look exactly like silence.
     set -- -m "$MODEL" -f "$_in" -l "$LANG_CODE" -nt -mc 8
     [ -n "$THREADS" ] && set -- "$@" -t "$THREADS"
+    # Bias decoding toward the user's own vocabulary before it ever has to be
+    # corrected after the fact.
+    _vprompt="$(vocab_prompt)"
+    if [ -n "$_vprompt" ]; then
+        set -- "$@" --prompt "$_vprompt"
+        log "vocabulary: biasing with ${#_vprompt} characters of terms"
+    fi
     _raw="$("$WHISPER" "$@" 2>>"$LOG")"
     _rc=$?
     rm -f "$NORM"
@@ -376,6 +511,12 @@ transcribe_wav() {
         | "$SED" -E 's/\[[^]]*\]//g; s/\*[^*]*\*//g' \
         | "$TR" '\n' ' ' \
         | "$SED" -E 's/  +/ /g; s/^ +//; s/ +$//')"
+
+    # Deterministic fix-ups for what the model still gets wrong. Applied before
+    # the empty check so a rule may legitimately blank a transcript.
+    _before="$_text"
+    _text="$(apply_replacements "$_text")"
+    [ "$_text" = "$_before" ] || log "replacements applied: [$_before] -> [$_text]"
 
     [ -n "$_text" ] || nothing "no speech detected (only non-speech markers) in ${_secs}s of audio"
 
@@ -396,7 +537,8 @@ cmd_start() {
     rm -f "$WAV" "$NORM"
     printf '%s\n' "${DEVICE:-system default input}" > "$DEVFILE"
 
-    _pid="$(spawn_recorder)"
+    spawn_recorder
+    _pid="$REC_PID"
     printf '%s\n' "$_pid" > "$PIDFILE"
 
     # Confirm the recorder actually came up. sox exits immediately when the
@@ -437,6 +579,58 @@ cmd_stop() {
     transcribe_wav "$WAV" "capture from $(cat "$DEVFILE" 2>/dev/null)"
 }
 
+# One-shot dictation: record, wait for the recording to end, transcribe. This
+# is the mode auto-stop needs, because something has to be waiting for the
+# recorder to finish on its own. It ends when any of these happens:
+#   - speech stops for SILENCE_SEC (when auto-stop is enabled)
+#   - MAX_SEC is reached
+#   - `whisper-local finish` signals the recorder from elsewhere
+cmd_dictate() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --silence) shift; SILENCE_SEC="${1:-0}" ;;
+            *) die "unknown option for dictate: $1" ;;
+        esac
+        shift
+    done
+    require_sox
+    require_whisper
+    log "──── dictate ────"
+    stop_recorder
+    rm -f "$WAV" "$NORM"
+    printf '%s\n' "${DEVICE:-system default input}" > "$DEVFILE"
+
+    spawn_recorder
+    printf '%s\n' "$REC_PID" > "$PIDFILE"
+    if [ "$SILENCE_SEC" = "0" ]; then
+        log "dictate: auto-stop disabled; waiting for 'finish' or the ${MAX_SEC}s cap"
+    fi
+
+    # A signal-terminated recorder makes wait return non-zero, which is a
+    # normal ending here, not a failure.
+    rm -f "$TRANSCRIBING"
+    wait "$REC_PID" 2>/dev/null
+    rm -f "$PIDFILE"
+    # The recorder has stopped and the model is about to run. A front end polls
+    # for this file to switch its indicator, which costs it a stat() rather
+    # than spawning a process every half second.
+    : > "$TRANSCRIBING"
+
+    [ -s "$WAV" ] || nothing "no audio captured — nothing was above the silence threshold ($SILENCE_THRESHOLD), or the input is not delivering audio"
+    HISTORY_SOURCE="mic"
+    transcribe_wav "$WAV" "dictate from $(cat "$DEVFILE" 2>/dev/null)"
+    rm -f "$TRANSCRIBING"
+}
+
+# End a recording without transcribing it. The `dictate` process that owns the
+# recorder notices it exit and does the transcription itself, so this is how a
+# hotkey stops dictation early without racing for the same audio.
+cmd_finish() {
+    [ -f "$PIDFILE" ] || die "no recording in progress"
+    stop_recorder
+    log "finished by request"
+}
+
 cmd_toggle() {
     if recorder_alive "$(current_pid)"; then cmd_stop; else cmd_start; fi
 }
@@ -457,6 +651,14 @@ cmd_transcribe() {
     rm -f "$_conv"
 }
 
+# Preview the replacement rules against arbitrary text. Authoring rules blind
+# and discovering the mistake in a real dictation is the slow way round.
+cmd_replace() {
+    if [ -n "${1:-}" ]; then _t="$1"; else _t="$(cat)"; fi
+    apply_replacements "$_t"
+    printf '\n'
+}
+
 cmd_status() {
     printf 'whisper-local %s\n\n' "$WHISPER_LOCAL_VERSION"
     printf '  sox       %s\n' "${SOX:-NOT FOUND}"
@@ -464,6 +666,13 @@ cmd_status() {
     printf '  model     %s\n' "${MODEL:-NOT FOUND}"
     printf '  input     %s\n' "${DEVICE:-system default}"
     printf '  language  %s\n' "$LANG_CODE"
+    if [ "$SILENCE_SEC" = "0" ]; then
+        printf '  auto-stop off (push-to-talk)\n'
+    else
+        printf '  auto-stop %ss below %s\n' "$SILENCE_SEC" "$SILENCE_THRESHOLD"
+    fi
+    printf '  vocab     %s\n' "$([ -s "$VOCAB_FILE" ] && printf '%s' "$VOCAB_FILE" || printf 'none')"
+    printf '  replace   %s\n' "$([ -s "$REPLACEMENTS_FILE" ] && printf '%s' "$REPLACEMENTS_FILE" || printf 'none')"
     printf '  config    %s%s\n' "$CONFIG_FILE" "$([ -r "$CONFIG_FILE" ] && echo '' || echo '  (none)')"
     printf '  state     %s\n' "$STATE_DIR"
     printf '  log       %s\n' "$LOG"
@@ -509,6 +718,7 @@ cmd_doctor() {
         "$SOX" -q -d -r 16000 -c 1 -b 16 "$_t" trim 0 3 2>&1
     fi
     [ -s "$_t" ] || { printf '  FAIL  no audio was captured at all.\n'; return 1; }
+    # shellcheck disable=SC2046  # splitting is intended: measure() emits 3 fields
     set -- $(measure "$_t")
     printf '  levels: peak=%s rms=%s duration=%ss\n' "$1" "$2" "$3"
     if "$AWK" "BEGIN{exit !(($1) < ($PEAK_MIN) || ($2) < ($RMS_MIN))}"; then
@@ -522,6 +732,32 @@ cmd_doctor() {
     else
         printf '  ok    input is live\n'
     fi
+    # Turn the measured peak into a silence threshold the user can paste in.
+    # The threshold has to sit above room noise and below speech; halfway
+    # between the two on a log scale is the safest single number.
+    "$AWK" -v peak="$1" '
+        BEGIN {
+            pct = peak * 100
+            printf "  speech peaked at %.2f%% of full scale\n", pct
+            if (pct > 0.2) {
+                rec = pct / 4
+                if (rec < 0.3) rec = 0.3
+                printf "  for auto-stop, try: WHISPER_LOCAL_SILENCE_THRESHOLD=\"%.1f%%\"\n", rec
+            }
+        }'
+
+    printf '\nVocabulary and replacements\n'
+    if [ -s "$VOCAB_FILE" ]; then
+        printf '  %s terms in %s\n' "$("$SED" -e 's/#.*$//' "$VOCAB_FILE" | "$AWK" 'NF' | /usr/bin/wc -l | "$TR" -d ' ')" "$VOCAB_FILE"
+    else
+        printf '  no vocabulary file (%s)\n' "$VOCAB_FILE"
+    fi
+    if [ -s "$REPLACEMENTS_FILE" ]; then
+        printf '  %s rules in %s\n' "$("$SED" -e 's/#.*$//' "$REPLACEMENTS_FILE" | "$AWK" '/=/' | /usr/bin/wc -l | "$TR" -d ' ')" "$REPLACEMENTS_FILE"
+    else
+        printf '  no replacements file (%s)\n' "$REPLACEMENTS_FILE"
+    fi
+
     rm -f "$_t"
     return "$_rc"
 }
@@ -652,6 +888,9 @@ whisper-local — offline push-to-talk dictation for macOS
   whisper-local start               begin recording
   whisper-local stop                finish recording, print the transcript
   whisper-local toggle              start if idle, stop if recording
+  whisper-local dictate [--silence N]
+                                    record until you stop speaking, then print
+  whisper-local finish              end a recording without transcribing it
   whisper-local transcribe FILE     transcribe an existing audio file
 
   whisper-local history [list [N]]  recent transcriptions, newest first
@@ -660,6 +899,7 @@ whisper-local — offline push-to-talk dictation for macOS
   whisper-local history copy [N]    copy entry N to the clipboard
   whisper-local history search Q    find past transcriptions containing Q
   whisper-local history add TEXT    record a transcription from elsewhere
+  whisper-local replace TEXT        preview your replacement rules on TEXT
   whisper-local history stats       how much has been dictated
   whisper-local history export      raw JSONL on stdout
   whisper-local history path        where history is stored
@@ -678,8 +918,11 @@ case "${1:-}" in
     start)       cmd_start ;;
     stop)        cmd_stop ;;
     toggle)      cmd_toggle ;;
+    dictate)     shift; cmd_dictate "$@" ;;
+    finish)      cmd_finish ;;
     transcribe)  shift; cmd_transcribe "${1:-}" ;;
     history)     shift; cmd_history "$@" ;;
+    replace)     shift; cmd_replace "${1:-}" ;;
     status)      cmd_status ;;
     doctor)      cmd_doctor ;;
     version|--version|-v) printf 'whisper-local %s\n' "$WHISPER_LOCAL_VERSION" ;;

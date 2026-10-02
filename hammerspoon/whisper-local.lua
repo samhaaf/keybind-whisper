@@ -16,8 +16,14 @@
 ---   historyCount  number         recent entries in the menu        (default 10)
 ---   timeout       number         seconds before a wedged run is killed
 ---
+---   autoStop      number         seconds of silence that end a recording
+---
 --- The menu bar lists recent transcriptions; clicking one copies it. To paste
 --- the last one at the cursor without recording again, bind pasteHotkey.
+---
+--- By default dictation is push-to-talk: the hotkey starts it and the hotkey
+--- stops it. Set autoStop to a number of seconds and it instead ends on its
+--- own once you stop speaking, with the hotkey still available to end it early.
 ---
 --- The CLI's output contract, which this file depends on:
 ---   exit 0 + non-empty stdout : the transcript
@@ -31,6 +37,7 @@ local M = {}
 local cfg = {
     hotkey       = { { "alt" }, "space" },  -- toggle dictation
     pasteHotkey  = nil,                     -- re-paste the last transcription
+    autoStop     = nil,                     -- seconds of silence that end a recording
     bin          = nil,
     menubar      = true,
     timeout      = 180,
@@ -42,6 +49,7 @@ local cfg = {
 local startTask, stopTask, doctorTask = nil, nil, nil
 local watchdog, busyAlert, menu = nil, nil, nil
 local hotkey, pasteHotkey = nil, nil
+local dictateTask, finishTask, phaseTimer = nil, nil, nil
 local recording = false
 
 -- ── Locating the CLI ────────────────────────────────────────────────────────
@@ -60,6 +68,16 @@ local function findBin()
         if attr and attr.mode ~= "directory" then return p end
     end
     return nil
+end
+
+-- Reading history is a file read, fast enough to do synchronously while the
+-- menu is being built. Recording and transcription stay asynchronous.
+local function cli(args)
+    local bin = findBin()
+    if not bin then return nil end
+    local out, ok = hs.execute(("%q %s 2>/dev/null"):format(bin, args))
+    if not ok then return nil end
+    return out
 end
 
 -- ── UI ──────────────────────────────────────────────────────────────────────
@@ -82,6 +100,7 @@ end
 local function clearBusy()
     if busyAlert then hs.alert.closeSpecific(busyAlert); busyAlert = nil end
     if watchdog then watchdog:stop(); watchdog = nil end
+    if phaseTimer then phaseTimer:stop(); phaseTimer = nil end
 end
 
 local function showError(msg)
@@ -192,8 +211,96 @@ function M.stop()
     stopTask:start()
 end
 
+-- ── Auto-stop flow ──────────────────────────────────────────────────────────
+-- With auto-stop, something has to wait for the recorder to end by itself, so
+-- a single blocking `dictate` owns the whole cycle and its callback delivers
+-- the transcript. The hotkey pressed again runs `finish`, which signals the
+-- recorder so that same `dictate` finishes early. Using `stop` here instead
+-- would have two processes racing to transcribe the same audio.
+local function stateDir()
+    local out = cli("status")
+    if not out then return nil end
+    return out:match("state%s+(%S+)")
+end
+
+-- Switch the indicator from recording to transcribing when the CLI drops its
+-- marker file. A stat() every half second, rather than spawning a process.
+local function watchForTranscribing()
+    local dir = stateDir()
+    if not dir then return end
+    local marker = dir .. "/transcribing"
+    if phaseTimer then phaseTimer:stop() end
+    phaseTimer = hs.timer.doEvery(0.5, function()
+        if hs.fs.attributes(marker) then
+            setState("transcribing")
+            if busyAlert then hs.alert.closeSpecific(busyAlert) end
+            busyAlert = hs.alert.show("⏳ transcribing…", math.huge)
+            if phaseTimer then phaseTimer:stop(); phaseTimer = nil end
+        end
+    end)
+end
+
+function M.dictate()
+    local bin = findBin()
+    if not bin then showError("whisper-local executable not found"); return end
+
+    recording = true
+    setState("recording")
+    busyAlert = hs.alert.show("🔴 listening… stops when you pause", math.huge)
+    watchForTranscribing()
+
+    dictateTask = hs.task.new(bin, function(code, stdout, stderr)
+        dictateTask = nil
+        recording = false
+        clearBusy()
+        setState("idle")
+
+        if code ~= 0 then
+            showError(stderr ~= "" and stderr or ("dictation failed (exit " .. tostring(code) .. ")"))
+            return
+        end
+        if not paste(stdout) then
+            local why = (stderr or ""):gsub("%s+$", "")
+            hs.alert.show("🫥 " .. (why ~= "" and why or "nothing heard"), 6)
+        end
+    end, { "dictate", "--silence", tostring(cfg.autoStop) })
+
+    if not dictateTask then
+        recording = false
+        clearBusy()
+        setState("idle")
+        showError("cannot execute " .. bin)
+        return
+    end
+
+    -- The watchdog covers the whole cycle here, which includes however long
+    -- the speaker keeps talking, so it is the recording cap plus the timeout.
+    watchdog = hs.timer.doAfter(cfg.timeout + 1800, function()
+        if dictateTask then dictateTask:terminate(); dictateTask = nil end
+        recording = false
+        clearBusy()
+        setState("idle")
+        showError("dictation timed out")
+    end)
+
+    dictateTask:start()
+end
+
+--- End an auto-stop recording early; `dictate` then transcribes what it has.
+function M.finish()
+    local bin = findBin()
+    if not bin then return end
+    finishTask = hs.task.new(bin, function() end, { "finish" })
+    if finishTask then finishTask:start() end
+end
+
 function M.toggle()
-    if recording then M.stop() else M.start() end
+    if cfg.autoStop then
+        -- Auto-stop mode: `dictate` owns the cycle, `finish` ends it early.
+        if recording then M.finish() else M.dictate() end
+    else
+        if recording then M.stop() else M.start() end
+    end
 end
 
 function M.isRecording() return recording end
@@ -222,16 +329,6 @@ function M.doctor()
 end
 
 -- ── History ─────────────────────────────────────────────────────────────────
--- Reading history is a file read, fast enough to do synchronously while the
--- menu is being built. Recording and transcription stay asynchronous.
-local function cli(args)
-    local bin = findBin()
-    if not bin then return nil end
-    local out, ok = hs.execute(("%q %s 2>/dev/null"):format(bin, args))
-    if not ok then return nil end
-    return out
-end
-
 --- Recent transcriptions, newest first, as { index = N, when = "...", text = "..." }.
 function M.recent(count)
     local out = cli("history list " .. tostring(count or 10))
@@ -324,11 +421,15 @@ function M.setup(opts)
     end
 
     -- Pick the real state back up after a config reload.
+    -- Resynchronize in BOTH directions. Setting the indicator to idle without
+    -- also clearing the flag would leave the UI and the state disagreeing, and
+    -- the next hotkey press would try to stop a recording that is not running.
     if recorderAlive() then
         recording = true
         setState("recording")
         print("[whisper-local] resumed: a recording was already in progress")
     else
+        recording = false
         setState("idle")
     end
 
