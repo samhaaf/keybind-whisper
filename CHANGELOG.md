@@ -3,6 +3,36 @@
 Notable changes to keybind-whisper. Versions follow
 [semantic versioning](https://semver.org/).
 
+## [1.2.0] — 2026-10-03
+
+### Added
+
+- **A shared model store**, searched before everything else:
+  `~/.cauldron/.models/<slug>/ggml-*.bin`, one directory per model. Weights are
+  large enough that a copy per project is a real cost; this puts them in one
+  place on the machine. The slug is arbitrary — discovery globs the
+  directories rather than requiring a naming convention — and the existing
+  whisper.cpp and Homebrew locations are still searched afterwards, so nothing
+  breaks. `KEYBIND_MODELS_DIR` moves the store.
+
+- `keybind-whisper models` lists every model found, marks the one in use, and
+  says why anything was rejected. With a shared store, "which weights is this
+  actually using" stops being obvious.
+
+### Changed
+
+- Discovery ranks candidate **files** rather than searching for a fixed list
+  of exact filenames. That is what lets the store use any layout, and it picks
+  up quantized variants, which were previously invisible.
+
+- Selection is by model quality first and directory order only as a tiebreak.
+  A better model in a legacy directory beats a worse one in the store, because
+  which weights get used changes the transcript and where they sit does not.
+
+- Quantized models are no longer judged against their family's size floor. A
+  `q5_0` turbo is a fraction of the full size and would have been rejected as
+  truncated; they now get a generic sanity floor instead.
+
 ## [1.1.0] — 2026-10-02
 
 ### Added

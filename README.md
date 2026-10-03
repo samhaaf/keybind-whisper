@@ -46,8 +46,37 @@ cd ~/code/whisper.cpp && cmake -B build && cmake --build build -j --config Relea
 ```
 
 `large-v3-turbo` is a good default: near the accuracy of `large-v3` at a
-fraction of the time. Any ggml model works — the tool finds the best one
-installed, or set `KEYBIND_MODEL`.
+fraction of the time. Any ggml model works, quantized ones included.
+
+### Where models live
+
+Weights are large enough that keeping a copy per project gets expensive, so
+the first place searched is a shared store — one directory per model:
+
+```
+~/.cauldron/.models/
+  whisper-large-v3-turbo/ggml-large-v3-turbo.bin
+  whisper-base-en/ggml-base.en.bin
+```
+
+The directory name is yours to choose; only the `ggml-*.bin` file inside
+matters. Move a model in with:
+
+```sh
+mkdir -p ~/.cauldron/.models/whisper-large-v3-turbo
+mv ggml-large-v3-turbo.bin ~/.cauldron/.models/whisper-large-v3-turbo/
+```
+
+`keybind-whisper models` lists everything found, which one is in use, and why
+anything was rejected. The usual whisper.cpp and Homebrew locations are still
+searched after the store, so an existing install keeps working untouched.
+
+Selection is by **model quality first, location second**: a better model in an
+old directory still beats a worse one in the store, because which weights get
+used changes the transcript and where they sit does not. Override everything
+with `KEYBIND_MODEL`.
+
+Set `KEYBIND_MODELS_DIR` to put the store somewhere else.
 
 ## Install
 
@@ -339,7 +368,8 @@ Everything works unconfigured. To change something, copy
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `KEYBIND_DEVICE` | *system default* | Pin one input device instead of following the OS |
-| `KEYBIND_MODEL` | best installed | Path to a ggml model |
+| `KEYBIND_MODEL` | best found | Path to a specific ggml model |
+| `KEYBIND_MODELS_DIR` | `~/.cauldron/.models` | Shared model store, searched first |
 | `KEYBIND_LANG` | `en` | Spoken language, or `auto` |
 | `KEYBIND_THREADS` | whisper's choice | Decoding threads |
 | `KEYBIND_PEAK_MIN` | `0.0008` | Silence gate, peak amplitude |
@@ -381,6 +411,8 @@ which needs Accessibility permission for the launching app.
 **Dictation is slower than it should be** — you are probably on the `cli`
 backend, or on `server` with nothing listening. `keybind-whisper doctor` says
 which, and `keybind-whisper serve` fixes the second.
+
+**Not sure which weights are being used** — `keybind-whisper models`.
 
 **A bad model file** — `doctor` validates it. A truncated download keeps the
 ggml magic bytes of a real model, so size is checked against what the filename
@@ -458,11 +490,12 @@ whisper can fall into on long audio. Non-speech annotations (`[BLANK_AUDIO]`,
 ./test/run-tests.sh
 ```
 
-Eighty-eight checks covering dependency resolution, the output contract, the
+Ninety-nine checks covering dependency resolution, the output contract, the
 silence and duration gates, stale-state handling, history storage and
 retrieval, the replacement matcher, auto-stop, state-directory safety, the
 installer under `curl | bash`, all three backends against a stand-in HTTP
-endpoint, model-file validation, and a real end-to-end transcription.
+endpoint, model-file validation, shared-store discovery, and a real
+end-to-end transcription.
 
 The Lua module has its own harness, which loads it against a stubbed
 Hammerspoon API:

@@ -36,7 +36,7 @@
 # errors are handled explicitly rather than exiting silently mid-pipeline.
 set -uo pipefail
 
-KEYBIND_VERSION="1.1.0"
+KEYBIND_VERSION="1.2.0"
 
 # ── Configuration ───────────────────────────────────────────────────────────
 # Every setting is an environment variable with a safe default. An optional
@@ -193,6 +193,11 @@ WHISPER="${KEYBIND_WHISPER_BIN:-$(resolve_bin whisper-cli \
 SWITCHAUDIO="${KEYBIND_SWITCHAUDIO:-$(resolve_bin SwitchAudioSource \
     /opt/homebrew/bin/SwitchAudioSource /usr/local/bin/SwitchAudioSource)}"
 
+# Shared model store. One directory per model, so weights live in one place on
+# the machine and every tool points at the same file instead of each keeping a
+# multi-gigabyte copy.
+MODELS_DIR="${KEYBIND_MODELS_DIR:-$HOME/.cauldron/.models}"
+
 # Is this file plausibly the model its name claims to be? Both checks are
 # needed and neither is sufficient alone: a truncated download keeps the ggml
 # magic of its first bytes, and a file of the right size could be anything.
@@ -201,13 +206,38 @@ SWITCHAUDIO="${KEYBIND_SWITCHAUDIO:-$(resolve_bin SwitchAudioSource \
 # at transcription time with nothing but an exit code to explain it.
 model_min_mb() {
     case "$1" in
+        # A quantized model is a fraction of its family's full size and the
+        # ratio varies by scheme, so the family floor would reject a perfectly
+        # good file. Fall back to a generic sanity floor instead.
+        *-q[2-8]_[01]*|*-q[2-8]k*|*-q[2-8]K*) echo 20 ;;
         *turbo*)  echo 700  ;;   # large-v3-turbo is ~1.5 GB, not ~3 GB
         *large*)  echo 2500 ;;
         *medium*) echo 1300 ;;
         *small*)  echo 400  ;;
         *base*)   echo 120  ;;
         *tiny*)   echo 60   ;;
-        *)        echo 0    ;;   # unknown naming: size cannot be judged
+        *)        echo 20   ;;   # unknown naming: only a sanity floor
+    esac
+}
+
+# Preference order, lowest first. Ranking by FILE rather than by searching for
+# exact filenames lets the store use any directory layout and still pick the
+# best model present, including quantized variants.
+model_rank() {
+    case "$(basename "$1")" in
+        ggml-large-v3-turbo*) echo 1  ;;
+        ggml-large-v3*)       echo 2  ;;
+        ggml-large-v2*)       echo 3  ;;
+        ggml-large*)          echo 4  ;;
+        ggml-medium.en*)      echo 5  ;;
+        ggml-medium*)         echo 6  ;;
+        ggml-small.en*)       echo 7  ;;
+        ggml-small*)          echo 8  ;;
+        ggml-base.en*)        echo 9  ;;
+        ggml-base*)           echo 10 ;;
+        ggml-tiny.en*)        echo 11 ;;
+        ggml-tiny*)           echo 12 ;;
+        *)                    echo 50 ;;
     esac
 }
 
@@ -227,33 +257,46 @@ model_problem() {
 
 # Model discovery: an explicit setting wins, otherwise search the usual places
 # in descending order of quality so a fresh install just works.
+# Every place a model may live, in the order they are searched. The shared
+# store comes first: it is the system-wide location, so a model placed there is
+# the one meant to be used, and nothing has to be copied per project.
+model_search_globs() {
+    # Slug directories first — one model per directory, any naming — then a
+    # flat drop at the store root, then the historical per-project locations.
+    printf '%s\n' \
+        "$MODELS_DIR"/*/ggml-*.bin \
+        "$MODELS_DIR"/ggml-*.bin \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/keybind-whisper/models"/ggml-*.bin \
+        "$HOME/.local/share/keybind-whisper/models"/ggml-*.bin \
+        "$HOME/code/whisper.cpp/models"/ggml-*.bin \
+        "$HOME/whisper.cpp/models"/ggml-*.bin \
+        "$HOME/src/whisper.cpp/models"/ggml-*.bin \
+        /opt/homebrew/share/whisper-cpp/models/ggml-*.bin \
+        /usr/local/share/whisper-cpp/models/ggml-*.bin
+}
+
+# Pick the best usable model found anywhere.
+#
+# Ranked by MODEL QUALITY first and directory order only as a tiebreak: a
+# better model in a legacy directory should still beat a worse one in the
+# shared store, because which weights get used affects the transcript and
+# where they sit does not.
 find_model() {
-    [ -n "${KEYBIND_MODEL:-}" ] && { printf '%s\n' "$KEYBIND_MODEL"; return 0; }
-    _dirs="${XDG_DATA_HOME:-$HOME/.local/share}/keybind-whisper/models
-$HOME/.local/share/keybind-whisper/models
-$HOME/code/whisper.cpp/models
-$HOME/whisper.cpp/models
-$HOME/src/whisper.cpp/models
-/opt/homebrew/share/whisper-cpp/models
-/usr/local/share/whisper-cpp/models"
-    _names="ggml-large-v3-turbo.bin ggml-large-v3.bin ggml-large-v2.bin
-ggml-medium.en.bin ggml-medium.bin ggml-small.en.bin ggml-small.bin
-ggml-base.en.bin ggml-base.bin ggml-tiny.en.bin ggml-tiny.bin"
-    for _n in $_names; do
-        for _d in $_dirs; do
-            if [ -f "$_d/$_n" ]; then
-                # Skip anything that fails validation rather than preferring it
-                # on filename alone; a corrupt file must not outrank a good
-                # smaller model further down the list.
-                if _why="$(model_problem "$_d/$_n")"; then
-                    log "ignoring $_d/$_n: $_why"
-                    continue
-                fi
-                printf '%s\n' "$_d/$_n"; return 0
-            fi
-        done
-    done
-    return 1
+    if [ -n "${KEYBIND_MODEL:-}" ]; then printf '%s\n' "$KEYBIND_MODEL"; return 0; fi
+    _best=""; _best_rank=9999
+    while IFS= read -r _f; do
+        [ -f "$_f" ] || continue          # unmatched globs stay literal
+        if _why="$(model_problem "$_f")"; then
+            log "ignoring $_f: $_why"
+            continue
+        fi
+        _r="$(model_rank "$_f")"
+        if [ "$_r" -lt "$_best_rank" ]; then _best_rank="$_r"; _best="$_f"; fi
+    done <<EOF
+$(model_search_globs)
+EOF
+    [ -n "$_best" ] || return 1
+    printf '%s\n' "$_best"
 }
 MODEL="$(find_model)"
 
@@ -988,6 +1031,35 @@ cmd_serve() {
     exec "$_srvbin" -m "$MODEL" --port "$_port" -l "$LANG_CODE"
 }
 
+# List every model found, which is selected, and why anything was rejected.
+# With a shared store the question "which weights is this actually using?"
+# stops being obvious, and a silently-skipped corrupt file should be visible.
+cmd_models() {
+    printf 'Shared store: %s%s\n\n' "$MODELS_DIR" \
+        "$([ -d "$MODELS_DIR" ] || printf '  (does not exist yet)')"
+    _selected="${MODEL:-}"
+    _any=0
+    while IFS= read -r _f; do
+        [ -f "$_f" ] || continue
+        _any=1
+        _mb=$(( $(/usr/bin/stat -f%z "$_f" 2>/dev/null || echo 0) / 1048576 ))
+        if _why="$(model_problem "$_f")"; then
+            printf '  %-9s %5s MB  %s\n' "UNUSABLE" "$_mb" "$_f"
+            printf '  %-9s           %s\n' "" "$_why"
+        elif [ "$_f" = "$_selected" ]; then
+            printf '  %-9s %5s MB  %s\n' "IN USE" "$_mb" "$_f"
+        else
+            printf '  %-9s %5s MB  %s\n' "ok" "$_mb" "$_f"
+        fi
+    done <<EOF
+$(model_search_globs)
+EOF
+    [ "$_any" -eq 1 ] || printf '  no models found\n'
+    printf '\nTo add one, put it in its own directory under the store:\n'
+    printf '  mkdir -p %s/whisper-large-v3-turbo\n' "$MODELS_DIR"
+    printf '  mv ggml-large-v3-turbo.bin %s/whisper-large-v3-turbo/\n' "$MODELS_DIR"
+}
+
 cmd_status() {
     printf 'keybind-whisper %s\n\n' "$KEYBIND_VERSION"
     printf '  backend   %s  (%s)\n' "$BACKEND" "$(privacy_line)"
@@ -1309,6 +1381,7 @@ keybind-whisper — offline push-to-talk dictation for macOS
   keybind-whisper history path        where history is stored
   keybind-whisper history clear --yes delete all stored transcriptions
 
+  keybind-whisper models              list the models found, and which is in use
   keybind-whisper serve               run the local server the fast backend uses
   keybind-whisper status              current state and resolved configuration
   keybind-whisper doctor              check dependencies and test the microphone
@@ -1328,6 +1401,7 @@ case "${1:-}" in
     transcribe)  shift; cmd_transcribe "${1:-}" ;;
     history)     shift; cmd_history "$@" ;;
     replace)     shift; cmd_replace "${1:-}" ;;
+    models)      cmd_models ;;
     serve)       cmd_serve ;;
     status)      cmd_status ;;
     doctor)      cmd_doctor ;;

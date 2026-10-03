@@ -538,6 +538,99 @@ case "$out" in
     *) bad "doctor says what to do about a bad model" "$out" ;;
 esac
 
+# ── Shared model store ──────────────────────────────────────────────────────
+printf '\nshared model store\n'
+
+# Build a plausible model file: the real ggml magic, padded past the family
+# floor so validation accepts it. No real weights needed to test discovery.
+mk_model() { # mk_model <path> <megabytes>
+    mkdir -p "$(dirname "$1")"
+    printf '\x6c\x6d\x67\x67' > "$1"
+    dd if=/dev/zero bs=1048576 count="$2" >> "$1" 2>/dev/null
+}
+
+STORE="$WORK/store"
+# A scratch HOME so the legacy per-project search paths do not exist and the
+# store is the only place a model can come from. Without this these tests would
+# silently assert against whatever models happen to be on the build machine.
+mkdir -p "$WORK/fakehome"
+model_for() { # model_for <store>
+    env -i HOME="$WORK/fakehome" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+        KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" \
+        KEYBIND_MODELS_DIR="$1" "$CLI" status 2>/dev/null \
+        | awk '/^  model/{print $2; exit}'
+}
+
+# One model per slug directory is the layout the store is built around.
+mk_model "$STORE/whisper-large-v3-turbo/ggml-large-v3-turbo.bin" 750
+got="$(model_for "$STORE")"
+check "a model in a slug directory is discovered" \
+    "$([ "$got" = "$STORE/whisper-large-v3-turbo/ggml-large-v3-turbo.bin" ] && echo 0 || echo 1)" \
+    "selected [$got]"
+
+# Slug naming must not matter, or the store would dictate a convention.
+STORE2="$WORK/store2"
+mk_model "$STORE2/anything-i-like/ggml-large-v3-turbo.bin" 750
+got="$(model_for "$STORE2")"
+check "the slug directory name is arbitrary" \
+    "$([ "$got" = "$STORE2/anything-i-like/ggml-large-v3-turbo.bin" ] && echo 0 || echo 1)" \
+    "selected [$got]"
+
+# A file dropped at the store root should still be found.
+STORE3="$WORK/store3"
+mk_model "$STORE3/ggml-base.en.bin" 130
+got="$(model_for "$STORE3")"
+check "a model at the store root is discovered" \
+    "$([ "$got" = "$STORE3/ggml-base.en.bin" ] && echo 0 || echo 1)" "selected [$got]"
+
+# The load-bearing ranking rule: which weights get used changes the
+# transcript, where they sit does not. A better model must win even when a
+# worse one sits in the preferred directory.
+STORE4="$WORK/store4"
+mk_model "$STORE4/whisper-tiny/ggml-tiny.bin" 70
+mk_model "$WORK/fakehome/code/whisper.cpp/models/ggml-large-v3-turbo.bin" 750
+got="$(model_for "$STORE4")"
+check "a better model outranks a worse one in the preferred store" \
+    "$([ "$got" = "$WORK/fakehome/code/whisper.cpp/models/ggml-large-v3-turbo.bin" ] && echo 0 || echo 1)" \
+    "picked [$got]"
+rm -rf "$WORK/fakehome/code"
+
+# And a corrupt file in the store must be skipped, not preferred by name.
+STORE5="$WORK/store5"
+mk_model "$STORE5/whisper-large/ggml-large-v3.bin" 5      # far below the floor
+mk_model "$STORE5/whisper-base/ggml-base.en.bin" 130
+got="$(model_for "$STORE5")"
+check "a truncated model in the store is skipped for a good smaller one" \
+    "$([ "$got" = "$STORE5/whisper-base/ggml-base.en.bin" ] && echo 0 || echo 1)" \
+    "selected [$got]"
+
+# Quantized models are a fraction of their family size, so the family floor
+# must not reject them.
+STORE6="$WORK/store6"
+mk_model "$STORE6/whisper-turbo-q5/ggml-large-v3-turbo-q5_0.bin" 60
+got="$(env -i HOME="$WORK/fakehome" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" \
+    KEYBIND_MODELS_DIR="$STORE6" KEYBIND_MODEL="$STORE6/whisper-turbo-q5/ggml-large-v3-turbo-q5_0.bin" \
+    "$CLI" status 2>/dev/null | grep "^  model")"
+case "$got" in
+    *truncated*) bad "a quantized model is not mistaken for a truncated one" "$got" ;;
+    *) ok "a quantized model is not mistaken for a truncated one" ;;
+esac
+
+# `models` has to show what was rejected, or a skipped file is invisible.
+out="$(env -i HOME="$WORK/fakehome" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" \
+    KEYBIND_MODELS_DIR="$STORE5" "$CLI" models 2>&1)"
+case "$out" in
+    *UNUSABLE*) ok "models reports an unusable file rather than hiding it" ;;
+    *) bad "models reports an unusable file rather than hiding it" "$out" ;;
+esac
+case "$out" in
+    *"IN USE"*) ok "models marks which one is selected" ;;
+    *) bad "models marks which one is selected" "$out" ;;
+esac
+
+
 # ── State directory safety ──────────────────────────────────────────────────
 printf '\nstate directory\n'
 

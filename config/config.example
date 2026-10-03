@@ -13,9 +13,18 @@
 # KEYBIND_DEVICE="USB Audio CODEC"
 
 # ── Model and language ──────────────────────────────────────────────────────
-# By default the newest, highest-quality ggml model found in the usual
-# whisper.cpp locations is used. Set this to pin a specific one.
-# KEYBIND_MODEL="$HOME/.local/share/keybind-whisper/models/ggml-large-v3-turbo.bin"
+# By default the best usable ggml model found is used. The shared store below
+# is searched first, then the usual whisper.cpp and Homebrew locations. Set
+# this to pin one specific file and skip discovery entirely.
+# KEYBIND_MODEL="$HOME/.cauldron/.models/whisper-large-v3-turbo/ggml-large-v3-turbo.bin"
+
+# Shared model store: one directory per model, so weights live in one place on
+# the machine instead of a multi-gigabyte copy per project. The directory name
+# inside is arbitrary; only the ggml-*.bin file matters.
+#   ~/.cauldron/.models/whisper-large-v3-turbo/ggml-large-v3-turbo.bin
+# Selection is by model quality first and location second, so a better model
+# elsewhere still wins. `keybind-whisper models` shows what was found.
+# KEYBIND_MODELS_DIR="$HOME/.cauldron/.models"
 
 # Spoken language, as an ISO 639-1 code. Use "auto" to detect it per recording,
 # at some cost in accuracy and speed.
