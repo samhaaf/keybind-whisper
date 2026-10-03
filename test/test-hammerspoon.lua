@@ -24,13 +24,18 @@ hs = {
     end },
     execute = function(cmd)
         executed[#executed + 1] = cmd
-        if cmd:match("status") then
-            return "keybind-whisper 1.0.0\n  state     /tmp/wl-test\n  recording no\n", true
-        elseif cmd:match("history list") then
+        -- Match on the unquoted form. Arguments are shell-quoted individually,
+        -- so the command reads 'history' 'list' rather than "history list";
+        -- comparing on the flattened text keeps this stub from breaking every
+        -- time the quoting changes.
+        local flat = cmd:gsub("'", "")
+        if flat:match("history list") then
             return "   1  2026-10-02 11:00:00  the newest one\n"
                 .. "   2  2026-10-02 10:59:00  the older one\n", true
-        elseif cmd:match("history show") then
+        elseif flat:match("history show") then
             return "the newest one\n", true
+        elseif flat:match("status") then
+            return "keybind-whisper 1.0.0\n  state     /tmp/wl-test\n  recording no\n", true
         end
         return "", true
     end,
@@ -121,6 +126,33 @@ M.toggle()
 check("second autoStop press runs finish",
       tasksMade[1] and tasksMade[1].args[1] == "finish",
       tasksMade[1] and tasksMade[1].args[1])
+
+-- Arguments reach the CLI through hs.execute, which runs a shell. Lua's %q
+-- quotes for Lua source, not for a shell: it leaves $(...) and backticks
+-- untouched, so a path containing either was executed. Assert the dangerous
+-- forms arrive single-quoted instead.
+executed = {}
+M.setup({ menubar = false, bin = "/tmp/$(whoami)/keybind-whisper" })
+M.recent(5)
+local cmd = executed[#executed] or ""
+check("a path with $( ) is single-quoted, not expanded",
+      cmd:find("'/tmp/$(whoami)/keybind-whisper'", 1, true) ~= nil, cmd)
+
+executed = {}
+M.setup({ menubar = false, bin = "/tmp/it's here/keybind-whisper" })
+M.recent(5)
+cmd = executed[#executed] or ""
+-- The POSIX idiom: close the quote, escape the quote, reopen it.
+check("an embedded single quote is escaped",
+      cmd:find([['/tmp/it'\''s here/keybind-whisper']], 1, true) ~= nil, cmd)
+
+-- Indices are interpolated into the command, so they must be numbers.
+executed = {}
+M.setup({ menubar = false, bin = "/tmp/keybind-whisper" })
+M.historyText("3; rm -rf ~")
+cmd = executed[#executed] or ""
+check("a non-numeric index is coerced, never passed through",
+      cmd:find("rm -rf", 1, true) == nil and cmd:find("'1'", 1, true) ~= nil, cmd)
 
 print(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

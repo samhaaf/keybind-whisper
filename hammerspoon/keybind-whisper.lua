@@ -72,10 +72,23 @@ end
 
 -- Reading history is a file read, fast enough to do synchronously while the
 -- menu is being built. Recording and transcription stay asynchronous.
-local function cli(args)
+-- Quote a value for the shell. Lua's %q quotes for LUA source, not for a
+-- shell: it wraps in double quotes and leaves $(...) and backticks untouched,
+-- so a path containing either would be EXECUTED by hs.execute. Single quotes
+-- with the embedded-quote escape are the only safe form.
+local function shq(s)
+    local escaped = tostring(s):gsub("'", "'\\''")
+    return "'" .. escaped .. "'"
+end
+
+-- Run the CLI with each argument quoted separately. Arguments are built from
+-- indices parsed out of previous output, so they are not inherently trusted.
+local function cli(...)
     local bin = findBin()
     if not bin then return nil end
-    local out, ok = hs.execute(("%q %s 2>/dev/null"):format(bin, args))
+    local parts = { shq(bin) }
+    for _, a in ipairs({ ... }) do parts[#parts + 1] = shq(a) end
+    local out, ok = hs.execute(table.concat(parts, " ") .. " 2>/dev/null")
     if not ok then return nil end
     return out
 end
@@ -309,9 +322,7 @@ function M.isRecording() return recording end
 -- capture process keeps holding the microphone, which would leave the UI idle
 -- and let the hotkey start a second recorder.
 local function recorderAlive()
-    local bin = findBin()
-    if not bin then return false end
-    local out = hs.execute(("%q status 2>/dev/null"):format(bin)) or ""
+    local out = cli("status") or ""
     return out:match("recording%s+YES") ~= nil
 end
 
@@ -331,7 +342,8 @@ end
 -- ── History ─────────────────────────────────────────────────────────────────
 --- Recent transcriptions, newest first, as { index = N, when = "...", text = "..." }.
 function M.recent(count)
-    local out = cli("history list " .. tostring(count or 10))
+    count = math.floor(tonumber(count) or 10)
+    local out = cli("history", "list", tostring(count))
     if not out then return {} end
     local items = {}
     for line in out:gmatch("[^\r\n]+") do
@@ -346,7 +358,8 @@ end
 
 --- Full text of a history entry (1 = most recent), or nil.
 function M.historyText(index)
-    local out = cli("history show " .. tostring(index or 1))
+    index = tonumber(index) or 1
+    local out = cli("history", "show", tostring(math.floor(index)))
     if not out or out == "" then return nil end
     return (out:gsub("%s+$", ""))
 end

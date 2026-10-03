@@ -38,6 +38,27 @@ REPO_URL="https://github.com/samhaaf/keybind-whisper"
 SRC_DEFAULT="$HOME/.local/share/keybind-whisper/src"
 MARK="keybind-whisper"   # how the init.lua line is recognized
 
+usage() {
+    cat <<'USAGE'
+install.sh — install keybind-whisper and wire it into Hammerspoon.
+
+  curl -fsSL https://github.com/samhaaf/keybind-whisper/raw/main/install.sh | bash
+
+With no arguments it installs the command, installs any missing Homebrew
+dependencies, links the Hammerspoon module, adds one line to init.lua, and
+reloads Hammerspoon. It backs up anything it touches, and running it twice
+changes nothing.
+
+  --no-deps          skip Homebrew dependency installation
+  --no-hammerspoon   install the command only
+  --no-wire          link the Hammerspoon module but do not edit init.lua
+  --no-reload        do not reload Hammerspoon afterwards
+  --whisper          also build whisper.cpp and download a model
+  --prefix DIR       install the command into DIR/bin (default ~/.local)
+  --uninstall        remove everything this script installs
+USAGE
+}
+
 say()   { printf '  %s\n' "$*"; }
 head2() { printf '\n%s\n\n' "$*"; }
 die()   { printf '\nerror: %s\n\n' "$*" >&2; exit 1; }
@@ -71,7 +92,7 @@ main() {
             --whisper)        DO_WHISPER=1 ;;
             --uninstall)      DO_UNINSTALL=1 ;;
             --prefix)         shift; PREFIX="${1:-$PREFIX}" ;;
-            -h|--help)        sed -n '3,22p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; return 0 ;;
+            -h|--help)        usage; return 0 ;;
             *) printf 'unknown option: %s\n' "$1" >&2; return 2 ;;
         esac
         shift

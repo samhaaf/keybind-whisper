@@ -350,6 +350,50 @@ check "the silence effect ends a stream on trailing silence" \
     "$(awk -v a="$long" -v b="$cut" 'BEGIN{exit !(b > 0.5 && b < a - 3)}' && echo 0 || echo 1)" \
     "input ${long}s produced ${cut}s; expected a substantial cut"
 
+# ── State directory safety ──────────────────────────────────────────────────
+printf '\nstate directory\n'
+
+# The default state directory lives under the world-writable /tmp, where
+# another user could plant a symlink at that path and read every capture and
+# transcript that passes through it.
+ln -s "$WORK/elsewhere" "$WORK/evil-state"
+out="$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    KEYBIND_STATE_DIR="$WORK/evil-state" "$CLI" status 2>&1)"; rc=$?
+check "a symlinked state directory is refused" \
+    "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc: $out"
+case "$out" in
+    *symlink*) ok "the refusal says why" ;;
+    *) bad "the refusal says why" "got: [$out]" ;;
+esac
+rm -f "$WORK/evil-state"
+
+# doctor opens the microphone. Doing that mid-dictation puts two processes on
+# the same input. A null-input sox stands in for a recorder, so no microphone
+# is needed to test the guard.
+mkdir -p "$WORK/state"
+# A real `sox -n ... trim 0 20` is NOT a stand-in: with a null input it computes
+# 20 seconds of silence as fast as it can and exits immediately, so the guard
+# correctly saw a dead process. What is needed is something long-lived whose
+# command line looks like the recorder, which is exactly what the guard checks.
+printf '#!/bin/sh\nsleep 30\n' > "$WORK/sox-recorder"
+chmod +x "$WORK/sox-recorder"
+"$WORK/sox-recorder" >/dev/null 2>&1 &
+SOXPID=$!
+echo "$SOXPID" > "$WORK/state/recorder.pid"
+sleep 0.3
+# Confirm the stand-in really is live and really does look like a recorder,
+# or the test below would pass for the wrong reason.
+if ! /bin/ps -o command= -p "$SOXPID" 2>/dev/null | grep -q sox; then
+    bad "the doctor guard test set itself up correctly" "the stand-in recorder is not running"
+fi
+out="$(run doctor 2>&1)"
+case "$out" in
+    *"recording is in progress"*) ok "doctor refuses to open the mic mid-recording" ;;
+    *) bad "doctor refuses to open the mic mid-recording" "$(printf '%s' "$out" | tail -3)" ;;
+esac
+kill "$SOXPID" 2>/dev/null; wait "$SOXPID" 2>/dev/null
+rm -f "$WORK/state/recorder.pid" "$WORK/sox-recorder"
+
 # ── Installer ───────────────────────────────────────────────────────────────
 printf '\ninstaller\n'
 
@@ -398,6 +442,14 @@ check "the installer links the command" \
 
 # Every command in the installer must be inside main(), called on the last
 # line, so bash parses the whole thing before executing any of it.
+# --help used to slice a line range out of "$0". Piped from curl there is no $0
+# file, so it printed nothing and exited 0.
+out="$(cat "$ROOT/install.sh" | bash -s -- --help 2>&1)"
+case "$out" in
+    *"install.sh"*"--uninstall"*) ok "--help works when the script is piped" ;;
+    *) bad "--help works when the script is piped" "got: [$out]" ;;
+esac
+
 check "the installer body is wrapped in main()" \
     "$([ "$(tail -1 "$ROOT/install.sh")" = 'main "$@"' ] && echo 0 || echo 1)" \
     "the last line is: $(tail -1 "$ROOT/install.sh")"

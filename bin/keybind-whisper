@@ -99,6 +99,22 @@ REPLACEMENTS_FILE="${KEYBIND_REPLACEMENTS_FILE:-$CONFIG_HOME/keybind-whisper/rep
 # different private $TMPDIR, so `start` and `stop` would not agree on a path.
 STATE_DIR="${KEYBIND_STATE_DIR:-/tmp/keybind-whisper-$(id -u)}"
 mkdir -p "$STATE_DIR" 2>/dev/null
+# Captured audio and transcripts pass through here, and the default lives under
+# the world-writable /tmp, where another user could pre-create the directory or
+# plant a symlink at that path and read everything. Refuse anything that is not
+# a real directory we own.
+if [ -L "$STATE_DIR" ]; then
+    printf 'refusing to use %s: it is a symlink\n' "$STATE_DIR" >&2
+    exit 1
+fi
+if [ ! -d "$STATE_DIR" ]; then
+    printf 'cannot create the state directory %s\n' "$STATE_DIR" >&2
+    exit 1
+fi
+if [ "$(/usr/bin/stat -f %u "$STATE_DIR" 2>/dev/null)" != "$(id -u)" ]; then
+    printf 'refusing to use %s: it is owned by another user\n' "$STATE_DIR" >&2
+    exit 1
+fi
 chmod 700 "$STATE_DIR" 2>/dev/null
 
 WAV="$STATE_DIR/capture.wav"
@@ -184,8 +200,10 @@ require_whisper() {
 }
 
 # ── Recorder process management ─────────────────────────────────────────────
-# True only when $1 is a live pid that really is one of our recorders, so a
-# recycled pid can never be signalled by mistake.
+# True only when $1 is a live pid that looks like one of our recorders, so a
+# recycled pid is not signalled by mistake. The name match is a sanity check
+# rather than a security boundary: the pid came from a file in a 0700 directory
+# we own, which is what actually makes it trustworthy.
 recorder_alive() {
     _pid="${1:-}"
     [ -n "$_pid" ] || return 1
@@ -707,6 +725,12 @@ cmd_doctor() {
     printf '  configured: %s\n' "${DEVICE:-system default}"
 
     [ "$_rc" -eq 0 ] || { printf '\nDependencies are missing; skipping the microphone test.\n'; return 1; }
+
+    if recorder_alive "$(current_pid)"; then
+        printf '\nA recording is in progress; skipping the microphone test.\n'
+        printf 'Finish dictating, then run doctor again.\n'
+        return "$_rc"
+    fi
 
     printf '\nMicrophone test — recording 3 seconds from %s.\n' "${DEVICE:-the system default input}"
     printf 'Say something now.\n'

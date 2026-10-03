@@ -3,7 +3,7 @@
 Notable changes to keybind-whisper. Versions follow
 [semantic versioning](https://semver.org/).
 
-## [1.0.0] — unreleased
+## [1.0.0] — 2026-10-02
 
 First public release.
 
@@ -54,6 +54,27 @@ First public release.
 - Timestamped log of every run, including measured audio levels. whisper's
   stderr goes to the log rather than `/dev/null`, so a failing model load does
   not look identical to silence.
+
+### Hardening
+
+- The installer survives `curl | bash`. Bash reads a piped script from stdin as
+  it executes, so any child that reads stdin consumes the rest of the script
+  and bash exits 0 partway through, looking like success. `hs -c` does exactly
+  that, and the installer was silently stopping right after reloading
+  Hammerspoon. The whole body is now one `main()` called on the last line, and
+  every child that might read stdin gets `</dev/null`.
+- `install.sh --help` works when piped. It previously sliced a line range out
+  of `"$0"`, which does not exist when the script arrives on stdin, so it
+  printed nothing and exited 0.
+- Arguments from the Hammerspoon module are shell-quoted properly. Lua's `%q`
+  quotes for Lua source, not for a shell: it wraps in double quotes and leaves
+  `$(...)` and backticks untouched, so an install path containing either was
+  executed by `hs.execute`. History indices are also coerced to numbers.
+- The state directory is refused if it is a symlink or owned by another user.
+  The default sits under the world-writable `/tmp`, where someone else could
+  plant a path and read every capture and transcript passing through it.
+- `doctor` refuses to open the microphone while a recording is in progress,
+  rather than putting two processes on the same input.
 
 ### Notes for packagers and contributors
 

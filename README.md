@@ -1,5 +1,7 @@
 # keybind-whisper
 
+[![CI](https://github.com/samhaaf/keybind-whisper/actions/workflows/ci.yml/badge.svg)](https://github.com/samhaaf/keybind-whisper/actions/workflows/ci.yml)
+
 Offline push-to-talk dictation for macOS. Press a key, speak, press it again —
 the text is transcribed by [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
 on your own machine and pasted at the cursor.
@@ -368,10 +370,10 @@ whisper can fall into on long audio. Non-speech annotations (`[BLANK_AUDIO]`,
 ./test/run-tests.sh
 ```
 
-Fifty-three checks covering dependency resolution, the output contract, the
+Sixty-six checks covering dependency resolution, the output contract, the
 silence and duration gates, stale-state handling, history storage and
-retrieval, the replacement matcher, auto-stop, and a real end-to-end
-transcription.
+retrieval, the replacement matcher, auto-stop, state-directory safety, the
+installer under `curl | bash`, and a real end-to-end transcription.
 
 The Lua module has its own harness, which loads it against a stubbed
 Hammerspoon API:
