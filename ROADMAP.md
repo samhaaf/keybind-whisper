@@ -18,6 +18,11 @@ window, would make the recommendation trustworthy enough to apply
 automatically. Auto-stop is opt-in largely because the threshold is currently a
 guess the user has to validate.
 
+**A supervised local server.** `keybind-whisper serve` has to be left running
+in a terminal. A launchd agent that starts it at login, and a `--daemon` flag
+that manages it, would make the fast backend the obvious default rather than
+something you opt into and then forget to start.
+
 **Per-application behaviour.** Different vocabulary and replacement sets
 depending on the frontmost application — code identifiers in an editor, prose
 elsewhere. The CLI already takes file paths for both, so the front end can
@@ -25,6 +30,11 @@ select them; what is missing is the matching logic and the configuration
 format.
 
 ## Considered, not committed
+
+**Streaming into the server backend.** The server already holds the model
+resident; feeding it audio as it is captured rather than after the fact is a
+smaller step from here than it was from the CLI backend, though still a real
+change to the recording path.
 
 **LLM cleanup of transcripts.** Removing filler words, fixing grammar, and
 reflowing dictated text into prose. This is the feature most at odds with the

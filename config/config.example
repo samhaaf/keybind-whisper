@@ -41,6 +41,34 @@
 # cannot fill the disk.
 # KEYBIND_MAX_SEC="1800"
 
+# ── Backend: where transcription actually runs ──────────────────────────────
+# cli     (default) spawn whisper-cli per utterance. Nothing to run, works
+#         offline, cannot be misconfigured — and reloads the whole model every
+#         single time, which is over half the latency of a short dictation.
+# server  POST to a local whisper-server holding the model resident. Same
+#         machine, same weights, roughly 3.7x faster. Start it with:
+#           keybind-whisper serve
+# api     POST to an OpenAI-shaped endpoint. THIS UPLOADS YOUR AUDIO unless the
+#         URL is local. Never chosen automatically, never used as a fallback.
+# KEYBIND_BACKEND="cli"
+
+# Where `server` dials, and where `keybind-whisper serve` listens.
+# KEYBIND_SERVER_URL="http://127.0.0.1:8080"
+
+# An unreachable local server falls back to the local CLI by default: both are
+# on this machine, and losing dictation you already spoke helps nobody. The
+# fallback is logged and `doctor` reports the server as down. Set to 0 to make
+# an unreachable server a hard error instead.
+# KEYBIND_SERVER_FALLBACK="1"
+
+# Any endpoint implementing POST /v1/audio/transcriptions.
+# KEYBIND_API_URL="https://api.openai.com/v1/audio/transcriptions"
+# Required unless the endpoint is on localhost. Passed to curl through a
+# mode-0600 config file, never on the command line, and redacted from the log.
+# KEYBIND_API_KEY=""
+# KEYBIND_API_MODEL="whisper-1"
+# KEYBIND_HTTP_TIMEOUT="120"
+
 # ── Auto-stop on silence ────────────────────────────────────────────────────
 # Seconds of silence that end a recording. 0 (the default) means push-to-talk:
 # recording ends when you say it does.

@@ -339,6 +339,20 @@ function M.doctor()
     if doctorTask then doctorTask:start() else hs.alert.closeSpecific(alert) end
 end
 
+-- ── Backend ─────────────────────────────────────────────────────────────────
+-- Transcription may run locally or against a remote endpoint. The menu says
+-- which, and says it loudly when audio is leaving the machine: that is the
+-- project's central claim, and a setting that quietly contradicts it should
+-- never be invisible from the UI.
+function M.backend()
+    local out = cli("status")
+    if not out then return nil end
+    local name = out:match("backend%s+(%S+)")
+    local remote = out:match("AUDIO IS SENT TO (%S+)")
+    local serverDown = out:match("server%s+%S+%s+DOWN") ~= nil
+    return { name = name, remote = remote, serverDown = serverDown }
+end
+
 -- ── History ─────────────────────────────────────────────────────────────────
 --- Recent transcriptions, newest first, as { index = N, when = "...", text = "..." }.
 function M.recent(count)
@@ -416,6 +430,25 @@ function M.setup(opts)
                 end
 
                 items[#items + 1] = { title = "-" }
+
+                local b = M.backend()
+                if b and b.remote then
+                    -- Deliberately prominent and deliberately not a tooltip.
+                    items[#items + 1] = {
+                        title = "⚠️  Audio is sent to " .. b.remote,
+                        tooltip = "Set KEYBIND_BACKEND=cli to keep audio on this machine",
+                        disabled = true,
+                    }
+                elseif b and b.serverDown then
+                    items[#items + 1] = {
+                        title = "⚠️  Local server is down — using the slower CLI",
+                        tooltip = "Run: keybind-whisper serve",
+                        disabled = true,
+                    }
+                elseif b and b.name and b.name ~= "cli" then
+                    items[#items + 1] = { title = "Backend: " .. b.name, disabled = true }
+                end
+
                 items[#items + 1] = { title = "Test microphone (3s)…", fn = M.doctor }
                 return items
             end)

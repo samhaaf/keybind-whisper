@@ -3,6 +3,58 @@
 Notable changes to keybind-whisper. Versions follow
 [semantic versioning](https://semver.org/).
 
+## [1.1.0] — 2026-10-02
+
+### Added
+
+- **Backends.** `KEYBIND_BACKEND` selects where transcription runs: `cli`
+  (default, unchanged), `server` (a local whisper-server holding the model
+  resident), or `api` (any OpenAI-shaped endpoint).
+
+  The measurement that motivated this: on an M1 Pro with `large-v3-turbo`,
+  **1.6 s of a 2.9 s dictation was spent reloading 1.5 GB of weights** — more
+  than half, on every single utterance. The `server` backend loads once and
+  takes a dictation from ~2.9 s to ~0.8 s, same machine and same weights.
+  `whisper-server` ships with whisper.cpp, so this adds no dependency.
+
+- `keybind-whisper serve` starts that server with the configured model and
+  port, because hand-assembling the command was enough friction to keep people
+  on the slow default.
+
+- Vocabulary biasing works through every backend, not just the CLI.
+
+### Privacy
+
+The `api` backend is the one thing that can make "nothing leaves the machine"
+untrue, so it is constrained rather than merely documented:
+
+- It is never selected automatically and never used as a fallback.
+- It refuses to run without a key unless the endpoint is on localhost.
+- A failure is reported, never quietly satisfied by transcribing locally —
+  falling back would silently change where the work happened.
+- `status`, `doctor` and the menu bar all name the endpoint and state that
+  audio is being uploaded.
+- The key reaches curl through a mode-0600 config file rather than argv, where
+  `ps` would expose it to every process of the same user, and it is redacted
+  from the log. Both properties are asserted by tests.
+- `doctor` makes no request for this backend: a diagnostic must not spend
+  credit or ship audio as a side effect.
+
+A local server falls back to the local CLI when it is down, since both are on
+this machine. That fallback is announced on stderr, logged, and reported by
+`doctor`, so a permanently-degraded setup is visible rather than just slow.
+`KEYBIND_SERVER_FALLBACK=0` makes it a hard error.
+
+### Fixed
+
+- Model files are validated instead of trusted by filename. A truncated
+  download keeps the ggml magic of a real model, so size is checked against
+  what the name claims. Found on a real machine: a 57 MB `ggml-medium.bin`
+  outranked every smaller good model in discovery and then failed at
+  transcription time with nothing but an exit code. Discovery now skips it,
+  `status` and `doctor` report it as truncated, and a load failure is
+  diagnosed as a corrupt model rather than a bare exit code.
+
 ## [1.0.0] — 2026-10-02
 
 First public release.

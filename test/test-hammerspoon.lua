@@ -35,7 +35,9 @@ hs = {
         elseif flat:match("history show") then
             return "the newest one\n", true
         elseif flat:match("status") then
-            return "keybind-whisper 1.0.0\n  state     /tmp/wl-test\n  recording no\n", true
+            return "keybind-whisper 1.0.0\n"
+                .. "  backend   " .. (hs._backendLine or "cli  (audio stays on this machine)") .. "\n"
+                .. "  state     /tmp/wl-test\n  recording no\n", true
         end
         return "", true
     end,
@@ -153,6 +155,28 @@ M.historyText("3; rm -rf ~")
 cmd = executed[#executed] or ""
 check("a non-numeric index is coerced, never passed through",
       cmd:find("rm -rf", 1, true) == nil and cmd:find("'1'", 1, true) ~= nil, cmd)
+
+-- A backend that sends audio off the machine must be visible in the UI, not
+-- just in a config file someone set months ago.
+hs._backendLine = "api  (AUDIO IS SENT TO https://api.openai.com/v1/audio/transcriptions)"
+M.setup({ menubar = true, bin = "/tmp/keybind-whisper" })
+local items = hs._menuBuilder()
+local titles = {}
+for _, it in ipairs(items) do titles[#titles + 1] = it.title end
+local joined = table.concat(titles, " | ")
+check("the menu warns when audio leaves the machine",
+      joined:find("Audio is sent to", 1, true) ~= nil, joined)
+
+hs._backendLine = "server  (audio stays on this machine (local server))\n  server    http://127.0.0.1:8080  DOWN"
+M.setup({ menubar = true, bin = "/tmp/keybind-whisper" })
+items = hs._menuBuilder()
+titles = {}
+for _, it in ipairs(items) do titles[#titles + 1] = it.title end
+joined = table.concat(titles, " | ")
+check("the menu warns when the local server is down",
+      joined:find("server is down", 1, true) ~= nil, joined)
+
+hs._backendLine = nil
 
 print(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

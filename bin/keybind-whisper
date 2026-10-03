@@ -36,7 +36,7 @@
 # errors are handled explicitly rather than exiting silently mid-pipeline.
 set -uo pipefail
 
-KEYBIND_VERSION="1.0.0"
+KEYBIND_VERSION="1.1.0"
 
 # ── Configuration ───────────────────────────────────────────────────────────
 # Every setting is an environment variable with a safe default. An optional
@@ -50,6 +50,31 @@ CONFIG_FILE="${KEYBIND_CONFIG:-$CONFIG_HOME/keybind-whisper/config}"
 # from whatever macOS has set as the system default input, so the tool follows
 # the OS the way every other app does. Set it only to pin one specific device.
 DEVICE="${KEYBIND_DEVICE:-}"
+
+# ── Backend ─────────────────────────────────────────────────────────────────
+# Where transcription actually happens.
+#
+#   cli     spawn whisper-cli per utterance. The default: nothing to run, works
+#           offline, and the audio never leaves the process tree. It also
+#           re-reads the whole model from disk every single time — about 1.6 s
+#           of a 2.9 s dictation on an M1 Pro with large-v3-turbo.
+#   server  POST to a local whisper-server that holds the model resident.
+#           Same machine, same weights, same privacy; roughly 3.7x faster
+#           because the load happens once at startup instead of per utterance.
+#   api     POST to an OpenAI-compatible transcription endpoint. THIS SENDS
+#           YOUR AUDIO OFF THE MACHINE unless the URL is a local one. It is
+#           never selected automatically and never used as a fallback.
+BACKEND="${KEYBIND_BACKEND:-cli}"
+SERVER_URL="${KEYBIND_SERVER_URL:-http://127.0.0.1:8080}"
+API_URL="${KEYBIND_API_URL:-https://api.openai.com/v1/audio/transcriptions}"
+API_KEY="${KEYBIND_API_KEY:-}"
+API_MODEL="${KEYBIND_API_MODEL:-whisper-1}"
+HTTP_TIMEOUT="${KEYBIND_HTTP_TIMEOUT:-120}"
+# A local server that is not running falls back to the local CLI, because both
+# are on this machine and a dictation you already spoke should not be lost to a
+# daemon that died. Never set this for the api backend: falling back there
+# would silently change where your audio goes.
+SERVER_FALLBACK="${KEYBIND_SERVER_FALLBACK:-1}"
 
 LANG_CODE="${KEYBIND_LANG:-en}"
 THREADS="${KEYBIND_THREADS:-}"
@@ -168,6 +193,38 @@ WHISPER="${KEYBIND_WHISPER_BIN:-$(resolve_bin whisper-cli \
 SWITCHAUDIO="${KEYBIND_SWITCHAUDIO:-$(resolve_bin SwitchAudioSource \
     /opt/homebrew/bin/SwitchAudioSource /usr/local/bin/SwitchAudioSource)}"
 
+# Is this file plausibly the model its name claims to be? Both checks are
+# needed and neither is sufficient alone: a truncated download keeps the ggml
+# magic of its first bytes, and a file of the right size could be anything.
+# Discovered on a real machine, where a 57 MB ggml-medium.bin sat next to a
+# good model and would have been preferred over every smaller one, then failed
+# at transcription time with nothing but an exit code to explain it.
+model_min_mb() {
+    case "$1" in
+        *turbo*)  echo 700  ;;   # large-v3-turbo is ~1.5 GB, not ~3 GB
+        *large*)  echo 2500 ;;
+        *medium*) echo 1300 ;;
+        *small*)  echo 400  ;;
+        *base*)   echo 120  ;;
+        *tiny*)   echo 60   ;;
+        *)        echo 0    ;;   # unknown naming: size cannot be judged
+    esac
+}
+
+model_problem() {
+    _m="$1"
+    [ -f "$_m" ] || { printf 'not found'; return 0; }
+    _magic="$(head -c 4 "$_m" 2>/dev/null | /usr/bin/xxd -p 2>/dev/null)"
+    [ "$_magic" = "6c6d6767" ] || { printf 'not a ggml model file (magic %s)' "${_magic:-none}"; return 0; }
+    _mb=$(( $(/usr/bin/stat -f%z "$_m" 2>/dev/null || echo 0) / 1048576 ))
+    _min="$(model_min_mb "$(basename "$_m")")"
+    if [ "$_min" -gt 0 ] && [ "$_mb" -lt "$_min" ]; then
+        printf 'truncated: %s MB, expected at least %s MB for this model' "$_mb" "$_min"
+        return 0
+    fi
+    return 1
+}
+
 # Model discovery: an explicit setting wins, otherwise search the usual places
 # in descending order of quality so a fresh install just works.
 find_model() {
@@ -184,7 +241,16 @@ ggml-medium.en.bin ggml-medium.bin ggml-small.en.bin ggml-small.bin
 ggml-base.en.bin ggml-base.bin ggml-tiny.en.bin ggml-tiny.bin"
     for _n in $_names; do
         for _d in $_dirs; do
-            [ -f "$_d/$_n" ] && { printf '%s\n' "$_d/$_n"; return 0; }
+            if [ -f "$_d/$_n" ]; then
+                # Skip anything that fails validation rather than preferring it
+                # on filename alone; a corrupt file must not outrank a good
+                # smaller model further down the list.
+                if _why="$(model_problem "$_d/$_n")"; then
+                    log "ignoring $_d/$_n: $_why"
+                    continue
+                fi
+                printf '%s\n' "$_d/$_n"; return 0
+            fi
         done
     done
     return 1
@@ -474,6 +540,229 @@ spawn_recorder() {
 # Shared back half of `stop` and `transcribe`: gate, normalize, transcribe,
 # clean. Takes a 16 kHz mono WAV. Prints the transcript, or exits via
 # nothing()/die() with a reason.
+# ── Backends ────────────────────────────────────────────────────────────────
+# Each takes a 16 kHz mono WAV and an optional vocabulary prompt, prints the
+# raw transcript on stdout, and returns non-zero with a reason on stderr.
+
+CURL="/usr/bin/curl"
+
+is_loopback_url() {
+    case "$1" in
+        http://127.0.0.1*|http://localhost*|http://[::1]*|https://127.0.0.1*|https://localhost*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Redact anything secret before it reaches the log. The key is also kept off
+# the command line entirely (see backend_api), because arguments are visible
+# in `ps` to every process running as this user.
+scrub() {
+    # Fixed-string redaction, not a regex. Building a pattern out of the key
+    # means escaping it, and an escape that is wrong anywhere makes the
+    # expression invalid — at which point the redactor FAILS OPEN and writes
+    # the secret it was supposed to hide. A key containing / broke exactly
+    # that way. index() and substr() need no escaping and cannot misparse.
+    #
+    # The key arrives through the environment rather than -v, because awk
+    # interprets backslash escapes in a -v value and a key may contain one.
+    if [ -n "$API_KEY" ]; then
+        _SCRUB_KEY="$API_KEY" "$AWK" '
+            BEGIN { k = ENVIRON["_SCRUB_KEY"] }
+            {
+                if (length(k) > 0) {
+                    while ((p = index($0, k)) > 0)
+                        $0 = substr($0, 1, p - 1) "<redacted>" substr($0, p + length(k))
+                }
+                # Belt and braces: redact anything bearer-shaped even if it is
+                # not the key we know about.
+                gsub(/Bearer [^" ]+/, "Bearer <redacted>")
+                print
+            }'
+    else
+        "$AWK" '{ gsub(/Bearer [^" ]+/, "Bearer <redacted>"); print }'
+    fi
+}
+
+# Turn an HTTP status into something a person can act on.
+http_explain() {
+    case "$1" in
+        000) printf 'could not connect (is it running, and is the URL right?)' ;;
+        400) printf 'the endpoint rejected the request (400)' ;;
+        401|403) printf 'authentication failed (%s) — check KEYBIND_API_KEY' "$1" ;;
+        404) printf 'no transcription endpoint at that URL (404)' ;;
+        413) printf 'the audio was too large for the endpoint (413)' ;;
+        429) printf 'rate limited (429) — try again shortly' ;;
+        5*)  printf 'the endpoint failed (%s)' "$1" ;;
+        *)   printf 'unexpected HTTP status %s' "$1" ;;
+    esac
+}
+
+backend_cli() {
+    _bwav="$1"; _bprompt="$2"
+    require_whisper
+    # -nt drops timestamps. -mc 8 bounds the decoder's text context, which
+    # prevents runaway repeat-loops on long captures. whisper's stderr goes to
+    # the log, never to /dev/null: discarding it makes a failing model load
+    # look exactly like silence.
+    set -- -m "$MODEL" -f "$_bwav" -l "$LANG_CODE" -nt -mc 8
+    [ -n "$THREADS" ] && set -- "$@" -t "$THREADS"
+    [ -n "$_bprompt" ] && set -- "$@" --prompt "$_bprompt"
+
+    _out="$("$WHISPER" "$@" 2>>"$LOG")"
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        # A truncated or corrupt model is the common cause and says so plainly
+        # in whisper's own output; without this it surfaces as a bare exit code.
+        if tail -n 40 "$LOG" 2>/dev/null | grep -q "not all tensors loaded\|failed to load model"; then
+            printf 'the model file looks corrupt or truncated: %s\n' "$MODEL" >&2
+        else
+            printf 'whisper-cli failed (exit %s) — see %s\n' "$_rc" "$LOG" >&2
+        fi
+        return 1
+    fi
+    printf '%s' "$_out"
+}
+
+# whisper.cpp's own server. Its route is /inference; it does NOT serve the
+# OpenAI path, so the two remote backends are deliberately separate rather
+# than one parameterised call.
+backend_server() {
+    _bwav="$1"; _bprompt="$2"
+    _url="${SERVER_URL%/}/inference"
+    _body="$STATE_DIR/http.$$.out"
+    log "server backend: POST $_url"
+    _code="$("$CURL" -sS --max-time "$HTTP_TIMEOUT" -o "$_body" -w '%{http_code}' \
+        -X POST "$_url" \
+        -F "file=@$_bwav" \
+        -F "response_format=text" \
+        -F "temperature=0" \
+        ${_bprompt:+-F "prompt=$_bprompt"} 2>>"$LOG")"
+    if [ "$_code" != "200" ]; then
+        printf 'whisper-server at %s: %s\n' "$SERVER_URL" "$(http_explain "$_code")" >&2
+        [ -s "$_body" ] && log "server body: $(head -c 400 "$_body")"
+        rm -f "$_body"
+        return 1
+    fi
+    cat "$_body"
+    rm -f "$_body"
+}
+
+# Any OpenAI-shaped /v1/audio/transcriptions endpoint: OpenAI itself, or a
+# local or self-hosted service that implements the same route.
+backend_api() {
+    _bwav="$1"; _bprompt="$2"
+    _body="$STATE_DIR/http.$$.out"
+    # The key goes in a curl config file, never in argv: command lines are
+    # readable by any process of this user via `ps`.
+    _cfg="$STATE_DIR/http.$$.cfg"
+    : > "$_cfg"; chmod 600 "$_cfg"
+    [ -n "$API_KEY" ] && printf 'header = "Authorization: Bearer %s"\n' "$API_KEY" >> "$_cfg"
+
+    log "api backend: POST $API_URL (model $API_MODEL)"
+    _code="$("$CURL" -sS --max-time "$HTTP_TIMEOUT" --config "$_cfg" -o "$_body" -w '%{http_code}' \
+        -X POST "$API_URL" \
+        -F "file=@$_bwav" \
+        -F "model=$API_MODEL" \
+        -F "response_format=text" \
+        ${LANG_CODE:+-F "language=$LANG_CODE"} \
+        ${_bprompt:+-F "prompt=$_bprompt"} 2>>"$LOG")"
+    rm -f "$_cfg"
+
+    if [ "$_code" != "200" ]; then
+        printf '%s: %s\n' "$API_URL" "$(http_explain "$_code")" >&2
+        if [ -s "$_body" ]; then
+            # Endpoints put the useful detail in the body; scrub before logging
+            # in case it echoes the request.
+            log "api body: $(head -c 400 "$_body" | scrub)"
+            head -c 200 "$_body" | scrub >&2
+            printf '\n' >&2
+        fi
+        rm -f "$_body"
+        return 1
+    fi
+    cat "$_body"
+    rm -f "$_body"
+}
+
+# Is the local server up? Used by status and doctor so a silently-degraded
+# setup — falling back to the CLI on every utterance and just feeling slow —
+# is visible rather than guesswork.
+server_reachable() {
+    "$CURL" -sS --max-time 3 -o /dev/null "${SERVER_URL%/}/" >/dev/null 2>&1
+}
+
+# One sentence on where the audio goes, because it is the project's central
+# claim and the api backend is the one thing that can make it untrue.
+privacy_line() {
+    case "$BACKEND" in
+        cli)    printf 'audio stays on this machine' ;;
+        server) printf 'audio stays on this machine (local server)' ;;
+        api)
+            if is_loopback_url "$API_URL"; then
+                printf 'audio stays on this machine (local endpoint)'
+            else
+                printf 'AUDIO IS SENT TO %s' "$API_URL"
+            fi
+            ;;
+        *) printf 'unknown backend' ;;
+    esac
+}
+
+# Dispatch, and the fallback policy. The policy is the point: server may fall
+# back to cli because both are local and losing an utterance to a dead daemon
+# helps nobody, while api never falls back in either direction — falling back
+# FROM it would silently change the result, and falling back TO it would
+# silently send audio off the machine.
+run_backend() {
+    _rwav="$1"; _rprompt="$2"
+    case "$BACKEND" in
+        cli)
+            backend_cli "$_rwav" "$_rprompt"
+            ;;
+        server)
+            if _out="$(backend_server "$_rwav" "$_rprompt")"; then
+                printf '%s' "$_out"
+            elif [ "$SERVER_FALLBACK" = "1" ]; then
+                # Loud in the log, and `doctor` reports server reachability, so
+                # a permanently-degraded setup is diagnosable rather than just
+                # mysteriously slow.
+                log "WARNING: whisper-server unreachable at $SERVER_URL; falling back to the local CLI"
+                printf 'whisper-server unreachable; used the local CLI instead\n' >&2
+                backend_cli "$_rwav" "$_rprompt"
+            else
+                return 1
+            fi
+            ;;
+        api)
+            backend_api "$_rwav" "$_rprompt"
+            ;;
+        *)
+            printf 'unknown backend: %s (expected cli, server or api)\n' "$BACKEND" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Refuse a misconfigured remote backend before recording rather than after, and
+# make the off-machine case impossible to enable by accident.
+check_backend() {
+    case "$BACKEND" in
+        cli) require_whisper ;;
+        server)
+            [ -x "$CURL" ] || die "curl not found at $CURL, which the server backend needs"
+            # The fallback runs the local CLI, so that has to be usable too.
+            [ "$SERVER_FALLBACK" = "1" ] && require_whisper
+            ;;
+        api)
+            [ -x "$CURL" ] || die "curl not found at $CURL, which the api backend needs"
+            if [ -z "$API_KEY" ] && ! is_loopback_url "$API_URL"; then
+                die "the api backend needs KEYBIND_API_KEY for a non-local endpoint ($API_URL)"
+            fi
+            ;;
+        *) die "unknown backend: $BACKEND (expected cli, server or api)" ;;
+    esac
+}
+
 transcribe_wav() {
     _src="$1"
     _label="${2:-audio}"
@@ -504,23 +793,17 @@ transcribe_wav() {
         _in="$_src"
     fi
 
-    # -nt drops timestamps. -mc 8 bounds the decoder's text context, which
-    # prevents runaway repeat-loops on long captures. whisper's stderr goes to
-    # the log, never to /dev/null: discarding it makes a failing model load
-    # look exactly like silence.
-    set -- -m "$MODEL" -f "$_in" -l "$LANG_CODE" -nt -mc 8
-    [ -n "$THREADS" ] && set -- "$@" -t "$THREADS"
     # Bias decoding toward the user's own vocabulary before it ever has to be
-    # corrected after the fact.
+    # corrected after the fact. Every backend takes a prompt, so vocabulary
+    # works the same wherever transcription happens.
     _vprompt="$(vocab_prompt)"
-    if [ -n "$_vprompt" ]; then
-        set -- "$@" --prompt "$_vprompt"
-        log "vocabulary: biasing with ${#_vprompt} characters of terms"
-    fi
-    _raw="$("$WHISPER" "$@" 2>>"$LOG")"
+    [ -n "$_vprompt" ] && log "vocabulary: biasing with ${#_vprompt} characters of terms"
+
+    _raw="$(run_backend "$_in" "$_vprompt")"
     _rc=$?
     rm -f "$NORM"
-    [ "$_rc" -eq 0 ] || die "whisper-cli failed (exit $_rc) — see $LOG"
+    # The backend has already explained itself on stderr.
+    [ "$_rc" -eq 0 ] || exit 1
 
     # Strip whisper's non-speech annotations — [BLANK_AUDIO], [SILENCE], and
     # the *music* / *wind* asterisk forms — then flatten to a single line.
@@ -578,7 +861,7 @@ cmd_start() {
 
 cmd_stop() {
     require_sox
-    require_whisper
+    check_backend
     log "──── stop ────"
 
     _was_recording=0
@@ -612,7 +895,7 @@ cmd_dictate() {
         shift
     done
     require_sox
-    require_whisper
+    check_backend
     log "──── dictate ────"
     stop_recorder
     rm -f "$WAV" "$NORM"
@@ -657,7 +940,7 @@ cmd_transcribe() {
     [ -n "${1:-}" ] || die "usage: keybind-whisper transcribe FILE"
     [ -f "$1" ] || die "no such file: $1"
     require_sox
-    require_whisper
+    check_backend
     log "──── transcribe $1 ────"
     # Convert whatever was handed in to whisper's native format first, so any
     # sox-readable file works regardless of rate, channels or container.
@@ -677,11 +960,55 @@ cmd_replace() {
     printf '\n'
 }
 
+# Start the local server the `server` backend talks to. Without this the fast
+# path means hand-assembling a whisper-server command with the right model and
+# port, which is enough friction that people simply stay on the slow default.
+cmd_serve() {
+    require_sox
+    [ -n "$WHISPER" ] || die "whisper-cli not found, so whisper-server is probably not built either"
+    [ -n "$MODEL" ] || die "no usable model found — set KEYBIND_MODEL"
+    if _why="$(model_problem "$MODEL")"; then
+        die "the configured model is unusable ($_why): $MODEL"
+    fi
+
+    _srvbin="$(dirname "$WHISPER")/whisper-server"
+    [ -x "$_srvbin" ] || die "whisper-server not found next to whisper-cli at $_srvbin — rebuild whisper.cpp"
+
+    # The port has to agree with what the backend will dial, so take it from
+    # the same setting rather than inventing a second source of truth.
+    _port="$(printf '%s' "$SERVER_URL" | "$SED" -nE 's|^[a-z]+://[^:/]+:([0-9]+).*$|\1|p')"
+    [ -n "$_port" ] || _port=8080
+
+    if server_reachable; then
+        die "something is already listening at $SERVER_URL"
+    fi
+
+    printf 'Starting whisper-server on port %s with %s\n' "$_port" "$(basename "$MODEL")"
+    printf 'Leave this running, and set KEYBIND_BACKEND=server. Ctrl-C to stop.\n\n'
+    exec "$_srvbin" -m "$MODEL" --port "$_port" -l "$LANG_CODE"
+}
+
 cmd_status() {
     printf 'keybind-whisper %s\n\n' "$KEYBIND_VERSION"
+    printf '  backend   %s  (%s)\n' "$BACKEND" "$(privacy_line)"
+    case "$BACKEND" in
+        server)
+            printf '  server    %s  %s\n' "$SERVER_URL" \
+                "$(server_reachable && printf 'up' || printf 'DOWN%s' "$([ "$SERVER_FALLBACK" = 1 ] && printf ' — falling back to the CLI on every utterance')")"
+            ;;
+        api)
+            printf '  endpoint  %s\n' "$API_URL"
+            printf '  api model %s\n' "$API_MODEL"
+            printf '  api key   %s\n' "$([ -n "$API_KEY" ] && printf 'set' || printf 'not set')"
+            ;;
+    esac
     printf '  sox       %s\n' "${SOX:-NOT FOUND}"
     printf '  whisper   %s\n' "${WHISPER:-NOT FOUND}"
-    printf '  model     %s\n' "${MODEL:-NOT FOUND}"
+    if [ -n "$MODEL" ] && _why="$(model_problem "$MODEL")"; then
+        printf '  model     %s  (%s)\n' "$MODEL" "$_why"
+    else
+        printf '  model     %s\n' "${MODEL:-NOT FOUND}"
+    fi
     printf '  input     %s\n' "${DEVICE:-system default}"
     printf '  language  %s\n' "$LANG_CODE"
     if [ "$SILENCE_SEC" = "0" ]; then
@@ -709,10 +1036,63 @@ cmd_doctor() {
     printf 'Dependencies\n'
     if [ -n "$SOX" ]; then printf '  ok    sox       %s\n' "$SOX"
     else printf '  FAIL  sox not found — brew install sox\n'; _rc=1; fi
+
+    # A remote backend needs neither whisper-cli nor a model, so report them as
+    # not-required rather than as failures.
+    _need_local=1
+    [ "$BACKEND" = "api" ] && _need_local=0
+    [ "$BACKEND" = "server" ] && [ "$SERVER_FALLBACK" != "1" ] && _need_local=0
+
     if [ -n "$WHISPER" ]; then printf '  ok    whisper   %s\n' "$WHISPER"
+    elif [ "$_need_local" -eq 0 ]; then printf '  --    whisper   not needed for the %s backend\n' "$BACKEND"
     else printf '  FAIL  whisper-cli not found — build whisper.cpp or set KEYBIND_WHISPER_BIN\n'; _rc=1; fi
-    if [ -n "$MODEL" ] && [ -f "$MODEL" ]; then printf '  ok    model     %s\n' "$MODEL"
-    else printf '  FAIL  no model found — set KEYBIND_MODEL\n'; _rc=1; fi
+
+    if [ -n "$MODEL" ] && _why="$(model_problem "$MODEL")"; then
+        printf '  FAIL  model     %s\n' "$MODEL"
+        printf '        %s\n' "$_why"
+        printf '        re-download it, or point KEYBIND_MODEL at a good one\n'
+        [ "$_need_local" -eq 1 ] && _rc=1
+    elif [ -n "$MODEL" ]; then
+        printf '  ok    model     %s\n' "$MODEL"
+    elif [ "$_need_local" -eq 0 ]; then
+        printf '  --    model     not needed for the %s backend\n' "$BACKEND"
+    else
+        printf '  FAIL  no usable model found — set KEYBIND_MODEL\n'; _rc=1
+    fi
+
+    printf '\nBackend\n'
+    printf '  %s — %s\n' "$BACKEND" "$(privacy_line)"
+    case "$BACKEND" in
+        server)
+            if server_reachable; then
+                printf '  ok    whisper-server is up at %s\n' "$SERVER_URL"
+            else
+                printf '  FAIL  no whisper-server at %s\n' "$SERVER_URL"
+                if [ "$SERVER_FALLBACK" = "1" ]; then
+                    printf '        every utterance is falling back to the CLI, which is ~3.7x slower\n'
+                fi
+                printf '        start one with:\n'
+                printf '          %s -m %s --port %s\n' \
+                    "$(dirname "${WHISPER:-whisper-cli}")/whisper-server" "${MODEL:-MODEL}" \
+                    "$(printf '%s' "$SERVER_URL" | "$SED" -E 's|.*:([0-9]+).*|\1|')"
+                _rc=1
+            fi
+            ;;
+        api)
+            # Deliberately NOT a live request: a diagnostic must not spend the
+            # user's money or ship their audio anywhere as a side effect.
+            if [ -n "$API_KEY" ]; then
+                printf '  ok    an API key is set\n'
+            elif is_loopback_url "$API_URL"; then
+                printf '  ok    no key needed for a local endpoint\n'
+            else
+                printf '  FAIL  KEYBIND_API_KEY is not set for %s\n' "$API_URL"; _rc=1
+            fi
+            is_loopback_url "$API_URL" || \
+                printf '  note  your audio is uploaded to this endpoint on every dictation\n'
+            printf '  note  no request was made; doctor does not send audio or spend credit\n'
+            ;;
+    esac
 
     printf '\nAudio input\n'
     if [ -n "$SWITCHAUDIO" ]; then
@@ -929,6 +1309,7 @@ keybind-whisper — offline push-to-talk dictation for macOS
   keybind-whisper history path        where history is stored
   keybind-whisper history clear --yes delete all stored transcriptions
 
+  keybind-whisper serve               run the local server the fast backend uses
   keybind-whisper status              current state and resolved configuration
   keybind-whisper doctor              check dependencies and test the microphone
   keybind-whisper version             print the version
@@ -947,6 +1328,7 @@ case "${1:-}" in
     transcribe)  shift; cmd_transcribe "${1:-}" ;;
     history)     shift; cmd_history "$@" ;;
     replace)     shift; cmd_replace "${1:-}" ;;
+    serve)       cmd_serve ;;
     status)      cmd_status ;;
     doctor)      cmd_doctor ;;
     version|--version|-v) printf 'keybind-whisper %s\n' "$KEYBIND_VERSION" ;;

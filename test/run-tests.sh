@@ -350,6 +350,194 @@ check "the silence effect ends a stream on trailing silence" \
     "$(awk -v a="$long" -v b="$cut" 'BEGIN{exit !(b > 0.5 && b < a - 3)}' && echo 0 || echo 1)" \
     "input ${long}s produced ${cut}s; expected a substantial cut"
 
+# ── Backends ────────────────────────────────────────────────────────────────
+printf '\nbackends\n'
+
+out="$(run status 2>&1)"
+case "$out" in
+    *"backend   cli"*) ok "the default backend is the local CLI" ;;
+    *) bad "the default backend is the local CLI" "$out" ;;
+esac
+case "$out" in
+    *"audio stays on this machine"*) ok "status states where the audio goes" ;;
+    *) bad "status states where the audio goes" "$out" ;;
+esac
+
+be() { # be <backend> <args...>
+    _b="$1"; shift
+    env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+        KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" \
+        KEYBIND_HISTORY=0 KEYBIND_VOCAB_FILE="$WORK/novocab" \
+        KEYBIND_REPLACEMENTS_FILE="$WORK/norepl" KEYBIND_LOG="$WORK/backend.log" \
+        KEYBIND_BACKEND="$_b" "$@" "$CLI" transcribe "$WORK/speech.aiff"
+}
+
+be telepathy >/dev/null 2>&1; rc=$?
+check "an unknown backend exits non-zero" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc"
+
+# The api backend must refuse a remote endpoint with no credentials BEFORE it
+# records or uploads anything, not after.
+out="$(be api 2>&1)"; rc=$?
+check "api without a key for a remote endpoint is refused" \
+    "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit was $rc"
+case "$out" in
+    *KEYBIND_API_KEY*) ok "the refusal names the missing setting" ;;
+    *) bad "the refusal names the missing setting" "$out" ;;
+esac
+
+if command -v python3 >/dev/null 2>&1; then
+    FAKE="$ROOT/test/fake-transcription-server.py"
+
+    start_fake() { # start_fake <port> <record> [extra args]
+        _p="$1"; shift
+        python3 "$FAKE" "$_p" "$@" >/dev/null 2>&1 &
+        FAKE_PID=$!
+        _n=0
+        until curl -s -o /dev/null "http://127.0.0.1:$_p/" 2>/dev/null; do
+            _n=$((_n + 1)); [ "$_n" -gt 100 ] && break
+            sleep 0.1
+        done
+    }
+    stop_fake() { kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null; }
+
+    # ── server backend ──────────────────────────────────────────────────────
+    start_fake 18431 "$WORK/rec-server.json"
+    out="$(be server KEYBIND_SERVER_URL=http://127.0.0.1:18431 2>"$WORK/be.err")"; rc=$?
+    stop_fake
+    check "the server backend transcribes through HTTP" \
+        "$([ "$rc" -eq 0 ] && [ "$out" = "the fake endpoint replied" ] && echo 0 || echo 1)" \
+        "exit $rc, out [$out], err $(cat "$WORK/be.err")"
+    if [ -f "$WORK/rec-server.json" ]; then
+        path="$(python3 -c "import json;print(json.load(open('$WORK/rec-server.json'))['path'])" 2>/dev/null)"
+        check "the server backend posts to /inference" \
+            "$([ "$path" = "/inference" ] && echo 0 || echo 1)" "posted to $path"
+    fi
+
+    # A dead local server must not lose an utterance the user already spoke:
+    # both paths are on this machine, so falling back costs nothing but speed.
+    out="$(be server KEYBIND_SERVER_URL=http://127.0.0.1:18432 2>"$WORK/be.err")"; rc=$?
+    check "an unreachable server falls back to the local CLI" \
+        "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "exit $rc: $(cat "$WORK/be.err")"
+    case "$(cat "$WORK/be.err")" in
+        *unreachable*) ok "the fallback is announced rather than silent" ;;
+        *) bad "the fallback is announced rather than silent" "$(cat "$WORK/be.err")" ;;
+    esac
+
+    out="$(be server KEYBIND_SERVER_URL=http://127.0.0.1:18432 KEYBIND_SERVER_FALLBACK=0 2>&1)"; rc=$?
+    check "fallback can be disabled, and then it fails loudly" \
+        "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit $rc: $out"
+
+    # ── api backend ─────────────────────────────────────────────────────────
+    start_fake 18433 "$WORK/rec-api.json" --require-auth
+    out="$(be api KEYBIND_API_URL=http://127.0.0.1:18433/v1/audio/transcriptions \
+                  KEYBIND_API_KEY=sk-test-SECRET-value 2>"$WORK/be.err")"; rc=$?
+    stop_fake
+    check "the api backend transcribes through HTTP" \
+        "$([ "$rc" -eq 0 ] && [ "$out" = "the fake endpoint replied" ] && echo 0 || echo 1)" \
+        "exit $rc, out [$out], err $(cat "$WORK/be.err")"
+
+    if [ -f "$WORK/rec-api.json" ]; then
+        auth="$(python3 -c "import json;print(json.load(open('$WORK/rec-api.json'))['authorization'])" 2>/dev/null)"
+        check "the api key is sent as a bearer token" \
+            "$([ "$auth" = "Bearer sk-test-SECRET-value" ] && echo 0 || echo 1)" "got [$auth]"
+        model="$(python3 -c "import json;print(json.load(open('$WORK/rec-api.json'))['fields'].get('model',''))" 2>/dev/null)"
+        check "the api backend sends a model name" \
+            "$([ -n "$model" ] && echo 0 || echo 1)" "got [$model]"
+    fi
+
+    # Credentials must never reach the log.
+    check "the api key never appears in the log" \
+        "$(grep -q "sk-test-SECRET-value" "$WORK/backend.log" 2>/dev/null && echo 1 || echo 0)" \
+        "the key was written to $WORK/backend.log"
+
+    # Nor the process list: argv is readable by every process of this user, so
+    # the key goes through a curl config file instead of -H.
+    check "the key is passed by config file, never on the command line" \
+        "$(grep -q 'curl.*-H.*Authorization' "$CLI" && echo 1 || echo 0)" \
+        "the source passes Authorization as a curl argument"
+    check "the implementation uses curl --config for credentials" \
+        "$(grep -q -- '--config "\$_cfg"' "$CLI" && echo 0 || echo 1)" \
+        "no --config use found in the api backend"
+
+    # Redaction must survive a key that is hostile to the redactor itself. An
+    # earlier sed-based version built a pattern out of the key, and a key
+    # containing / broke the expression — at which point the redactor failed
+    # OPEN and wrote the secret straight to the log. The fixture reflects the
+    # Authorization header back in its error body so there is really something
+    # to redact.
+    for hostile in 'sk-a|b&c.d*e$f[g]h/i' 'sk-/slash/key/' 'sk-"quoted"-key'; do
+        start_fake 18435 "$WORK/rec-hostile.json" --status 500
+        rm -f "$WORK/hostile.log"
+        err="$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+            KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" KEYBIND_HISTORY=0 \
+            KEYBIND_VOCAB_FILE="$WORK/novocab" KEYBIND_REPLACEMENTS_FILE="$WORK/norepl" \
+            KEYBIND_LOG="$WORK/hostile.log" KEYBIND_BACKEND=api \
+            KEYBIND_API_URL=http://127.0.0.1:18435/v1/audio/transcriptions \
+            KEYBIND_API_KEY="$hostile" \
+            "$CLI" transcribe "$WORK/speech.aiff" 2>&1)"
+        stop_fake
+        if grep -qF -- "$hostile" "$WORK/hostile.log" 2>/dev/null \
+           || printf '%s' "$err" | grep -qF -- "$hostile"; then
+            bad "a key with metacharacters is still redacted" "leaked: $hostile"
+        else
+            ok "a key with metacharacters is still redacted (${hostile})"
+        fi
+    done
+
+    # An authentication failure must be reported, and must NOT quietly produce
+    # a locally-transcribed result as though the endpoint had answered.
+    start_fake 18434 "$WORK/rec-401.json" --require-auth
+    out="$(be api KEYBIND_API_URL=http://127.0.0.1:18434/v1/audio/transcriptions 2>&1)"; rc=$?
+    stop_fake
+    check "an api auth failure exits non-zero" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "exit $rc"
+    case "$out" in
+        *authentication*) ok "an api auth failure says what went wrong" ;;
+        *) bad "an api auth failure says what went wrong" "$out" ;;
+    esac
+    case "$out" in
+        *"quick brown fox"*|*"test of silence"*)
+            bad "api never falls back to local transcription" "a local transcript was produced anyway" ;;
+        *) ok "api never falls back to local transcription" ;;
+    esac
+else
+    printf '  skip python3 unavailable; HTTP backends not tested\n'
+fi
+
+# ── Model validation ────────────────────────────────────────────────────────
+printf '\nmodel validation\n'
+
+# A truncated download keeps the ggml magic of its first bytes, so size has to
+# be judged against what the filename claims. Found on a real machine: a 57 MB
+# ggml-medium.bin that outranked every smaller good model and then failed at
+# transcription time with only an exit code.
+mkdir -p "$WORK/models"
+printf '\x6c\x6d\x67\x67' > "$WORK/models/ggml-medium.bin"
+dd if=/dev/zero bs=1048576 count=40 >> "$WORK/models/ggml-medium.bin" 2>/dev/null
+out="$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" \
+    KEYBIND_MODEL="$WORK/models/ggml-medium.bin" "$CLI" status 2>&1)"
+case "$out" in
+    *truncated*) ok "a truncated model is identified as truncated" ;;
+    *) bad "a truncated model is identified as truncated" "$(printf '%s' "$out" | grep -i model)" ;;
+esac
+
+printf 'this is not a model at all, not even close, padding padding' > "$WORK/models/ggml-tiny.bin"
+out="$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" \
+    KEYBIND_MODEL="$WORK/models/ggml-tiny.bin" "$CLI" status 2>&1)"
+case "$out" in
+    *"not a ggml model"*) ok "a file with the wrong magic is rejected" ;;
+    *) bad "a file with the wrong magic is rejected" "$(printf '%s' "$out" | grep -i model)" ;;
+esac
+
+out="$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    KEYBIND_STATE_DIR="$WORK/state" KEYBIND_CONFIG="$WORK/none" \
+    KEYBIND_MODEL="$WORK/models/ggml-medium.bin" "$CLI" doctor 2>&1)"
+case "$out" in
+    *"re-download"*) ok "doctor says what to do about a bad model" ;;
+    *) bad "doctor says what to do about a bad model" "$out" ;;
+esac
+
 # ── State directory safety ──────────────────────────────────────────────────
 printf '\nstate directory\n'
 

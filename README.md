@@ -6,7 +6,9 @@ Offline push-to-talk dictation for macOS. Press a key, speak, press it again —
 the text is transcribed by [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
 on your own machine and pasted at the cursor.
 
-No account, no network, no audio leaving the computer.
+No account, no network, no audio leaving the computer. (That last one is the
+default and the point; there is an opt-in backend that uses a remote API, and
+the tool says so loudly whenever it is on.)
 
 The name is the point of the design: dictation is *bound to a key*. Press it,
 talk, press it again. Nothing listens until you ask it to.
@@ -24,6 +26,8 @@ talk, press it again. Nothing listens until you ask it to.
   re-pastable — dictation you can go back to, not just a log file.
 - **Learns your words.** Proper nouns and jargon are biased toward during
   decoding and corrected deterministically afterwards.
+- **Fast when you want it.** A warm local server cuts a dictation from ~2.9 s
+  to ~0.8 s, same model, same machine.
 
 ## Requirements
 
@@ -137,6 +141,67 @@ Scripts can rely on this:
 
 stdout is only ever the transcript, so it is safe to paste blind. Diagnostics
 go to stderr and to the log.
+
+## Where transcription runs
+
+Three backends, chosen with `KEYBIND_BACKEND`:
+
+| Backend | Where | Speed | Audio leaves the machine |
+|---|---|---|---|
+| `cli` *(default)* | `whisper-cli`, one process per utterance | ~2.9 s | no |
+| `server` | a local `whisper-server` holding the model resident | **~0.8 s** | no |
+| `api` | any OpenAI-shaped `/v1/audio/transcriptions` | varies | **yes**, unless the URL is local |
+
+Timings are one 1.7 s utterance, `large-v3-turbo`, M1 Pro.
+
+### Why the default is the slow one
+
+`cli` reloads the whole model on every dictation. On the machine above that is
+**1.6 s of a 2.9 s dictation spent reading 1.5 GB off disk** — more than half,
+repeated every time you speak. It is still the default because it needs nothing
+running and cannot be misconfigured.
+
+### The fast path
+
+Start the server and point the backend at it:
+
+```sh
+keybind-whisper serve          # leave this running
+```
+
+```sh
+# ~/.config/keybind-whisper/config
+KEYBIND_BACKEND="server"
+```
+
+Same binary, same weights, same machine — the model is just loaded once instead
+of per utterance. If the server is not running, dictation falls back to the
+local CLI rather than failing, says so on stderr and in the log, and `doctor`
+reports the server as down so a permanently-slow setup is visible rather than
+mysterious. Set `KEYBIND_SERVER_FALLBACK=0` to make it a hard error instead.
+
+### Using a remote API
+
+```sh
+KEYBIND_BACKEND="api"
+KEYBIND_API_KEY="sk-..."
+# KEYBIND_API_URL defaults to OpenAI; point it anywhere OpenAI-shaped
+```
+
+This is the one setting that makes "nothing leaves the machine" untrue, so it
+behaves accordingly:
+
+- It is never selected automatically and is never used as a fallback.
+- It refuses to run without a key, unless the endpoint is on localhost.
+- `status`, `doctor` and the menu bar all state plainly that audio is being
+  uploaded, and name the endpoint.
+- Failures are reported, never quietly satisfied by transcribing locally
+  instead — if you asked for the endpoint, you get the endpoint or an error.
+- The key is passed to `curl` through a mode-0600 config file, never on the
+  command line where `ps` would expose it, and it is redacted from the log.
+
+`doctor` deliberately makes no request for this backend: a diagnostic should
+not spend your credit or ship your audio anywhere as a side effect.
 
 ## Getting your words right
 
@@ -288,6 +353,13 @@ Everything works unconfigured. To change something, copy
 | `KEYBIND_SILENCE_THRESHOLD` | `2%` | Amplitude below which audio counts as silence |
 | `KEYBIND_VOCAB_FILE` | `~/.config/keybind-whisper/vocabulary` | Terms to bias decoding toward |
 | `KEYBIND_REPLACEMENTS_FILE` | `~/.config/keybind-whisper/replacements` | Post-transcription fix-ups |
+| `KEYBIND_BACKEND` | `cli` | `cli`, `server`, or `api` |
+| `KEYBIND_SERVER_URL` | `http://127.0.0.1:8080` | Where the local server listens |
+| `KEYBIND_SERVER_FALLBACK` | `1` | `0` makes an unreachable server a hard error |
+| `KEYBIND_API_URL` | OpenAI's endpoint | Any OpenAI-shaped transcription URL |
+| `KEYBIND_API_KEY` | *(unset)* | Required for a non-local `api` endpoint |
+| `KEYBIND_API_MODEL` | `whisper-1` | Model name sent to the endpoint |
+| `KEYBIND_HTTP_TIMEOUT` | `120` | Seconds before an HTTP backend gives up |
 
 Environment variables override the config file.
 
@@ -305,6 +377,15 @@ playback quality. A wired or built-in microphone is more reliable.
 
 **Nothing pastes, but the transcript looks right** — pasting synthesizes ⌘V,
 which needs Accessibility permission for the launching app.
+
+**Dictation is slower than it should be** — you are probably on the `cli`
+backend, or on `server` with nothing listening. `keybind-whisper doctor` says
+which, and `keybind-whisper serve` fixes the second.
+
+**A bad model file** — `doctor` validates it. A truncated download keeps the
+ggml magic bytes of a real model, so size is checked against what the filename
+claims; a 57 MB `ggml-medium.bin` is reported as truncated rather than being
+preferred over a smaller good model and then failing mid-dictation.
 
 **It works in a terminal but not from the hotkey** — this is the classic one.
 GUI-launched processes on macOS inherit `PATH=/usr/bin:/bin:/usr/sbin:/sbin`,
@@ -346,13 +427,20 @@ machine".
 ## How it works
 
 ```
-hotkey ─▶ start ─▶ sox ─▶ 16 kHz mono WAV          ◀── auto-stop ends this
-hotkey ─▶ stop  ─▶ silence gate ─▶ normalize ─▶ whisper.cpp ◀── vocabulary
-                                                   │
-                                          replacements
-                                                   │
-                                         stdout ─▶ paste
-                                                   └─▶ history.jsonl
+hotkey ─▶ start ─▶ sox ─▶ 16 kHz mono WAV        ◀── auto-stop ends this
+hotkey ─▶ stop  ─▶ silence gate ─▶ normalize
+                                      │
+                                   backend ◀── vocabulary prompt
+                      ┌───────────────┼───────────────┐
+                   cli│            server│            │api
+            whisper-cli          HTTP /inference   HTTP /v1/…
+            (loads 1.5 GB      (model already     (off-machine
+             every time)          resident)        unless local)
+                      └───────────────┼───────────────┘
+                                 replacements
+                                      │
+                             stdout ─▶ paste
+                                      └─▶ history.jsonl
 ```
 
 Recording is a backgrounded `sox` process writing 16 kHz mono 16-bit — whisper's
@@ -370,10 +458,11 @@ whisper can fall into on long audio. Non-speech annotations (`[BLANK_AUDIO]`,
 ./test/run-tests.sh
 ```
 
-Sixty-six checks covering dependency resolution, the output contract, the
+Eighty-eight checks covering dependency resolution, the output contract, the
 silence and duration gates, stale-state handling, history storage and
 retrieval, the replacement matcher, auto-stop, state-directory safety, the
-installer under `curl | bash`, and a real end-to-end transcription.
+installer under `curl | bash`, all three backends against a stand-in HTTP
+endpoint, model-file validation, and a real end-to-end transcription.
 
 The Lua module has its own harness, which loads it against a stubbed
 Hammerspoon API:
